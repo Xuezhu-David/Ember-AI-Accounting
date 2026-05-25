@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Native Accounting | Ember AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=8">
+    <!-- Using Phosphor Icons for a clean, modern look -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Left Panel: AI Assistant -->
+        <aside class="sidebar glass-panel">
+            <div class="sidebar-header">
+                <div class="brand">
+                    <div class="logo-icon"><i class="ph ph-fire"></i></div>
+                    <span class="brand-name">Ember AI <span class="version">v1.1</span></span>
+                </div>
+                <button class="icon-btn"><i class="ph ph-gear"></i></button>
+            </div>
+
+            <div class="chat-history" id="chatHistory">
+                <!-- Welcome Message -->
+                <div class="message ai-message">
+                    <div class="avatar"><i class="ph ph-fire"></i></div>
+                    <div class="content">
+                        <p>你好！我是 Ember。我可以帮你根据自然语言描述自动生成会计凭证。</p>
+                        <p>📋 <strong>当前支持的凭证类型：</strong></p>
+                        <ul>
+                            <li><strong>销售收入</strong> — 销售商品或提供服务产生的收入</li>
+                        </ul>
+                        <p>📎 <strong>支持的上传格式：</strong>Excel (.xlsx/.xls) / 图片 (.png/.jpg 等) / PDF (.pdf)</p>
+                        <p>你可以试着说：<em>"销售软件产品给华为公司，不含税金额100000元，税率13%"</em>，或上传销售发票 Excel / 发票照片 / PDF。</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <button class="attachment-btn" id="uploadBtn" title="上传文件">
+                        <i class="ph ph-paperclip"></i>
+                    </button>
+                    <textarea id="userInput" placeholder="描述交易内容或上传文件..." rows="1"></textarea>
+                    <button class="send-btn" id="sendBtn">
+                        <i class="ph ph-paper-plane-right"></i>
+                    </button>
+                </div>
+                <input type="file" id="fileInput" hidden multiple accept=".xlsx,.xls,.csv,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pdf">
+            </div>
+        </aside>
+
+        <!-- Right Panel: Workspace -->
+        <main class="workspace glass-panel">
+            <!-- Workspace Tab Bar -->
+            <div class="workspace-tabs">
+                <button class="workspace-tab active" data-tab="voucher" id="tabVoucher">
+                    <i class="ph ph-receipt"></i> 凭证
+                </button>
+                <button class="workspace-tab" data-tab="rules" id="tabRules">
+                    <i class="ph ph-list-dashes"></i> 凭证规则
+                </button>
+            </div>
+
+            <!-- Tab: Voucher -->
+            <div class="tab-content active" id="tabContentVoucher">
+                <!-- Initial Empty State -->
+                <div id="initialState" class="empty-state-large">
+                    <div class="icon-pulse"><i class="ph ph-sparkle"></i></div>
+                    <h3>等待指令</h3>
+                    <p>请在左侧描述业务或上传单据，AI 将为您生成凭证。</p>
+                </div>
+
+                <!-- Content Container (Hidden initially) -->
+                <div id="workspaceContent" style="display: none;">
+                    <!-- Source Data Section -->
+                    <div class="section source-data-section">
+                        <div class="section-header">
+                            <h2>原始凭证 / 数据源</h2>
+                            <div class="header-actions">
+                                <span class="badge" id="sourceBadge">0 份文件</span>
+                                <button class="icon-btn-small" id="toggleSourceData"><i class="ph ph-caret-up"></i></button>
+                            </div>
+                        </div>
+                        <div class="section-content" id="sourceDataContent">
+                            <!-- Items will be injected here -->
+                        </div>
+                    </div>
+
+                    <!-- Transaction Creation Section -->
+                    <div class="section transaction-section">
+                        <div class="section-header">
+                            <h2>生成凭证</h2>
+                            <div class="header-actions">
+                                <button class="btn btn-primary" id="createTransactionBtn">
+                                    确认并记账 <i class="ph ph-check-circle"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="transaction-form">
+                            <div class="form-header-details">
+                                <div class="form-group">
+                                    <label>凭证号</label>
+                                    <div class="read-only-field" id="voucherIdField">—</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>公司代码</label>
+                                    <div class="read-only-field" id="companyCodeField">—</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>凭证类型</label>
+                                    <div class="read-only-field" id="docTypeField">—</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>凭证日期</label>
+                                    <input type="date" class="date-input" id="docDateField">
+                                </div>
+                                <div class="form-group">
+                                    <label>过账日期</label>
+                                    <input type="date" class="date-input" id="postDateField">
+                                </div>
+                                <div class="form-group">
+                                    <label>参考</label>
+                                    <div class="read-only-field" id="referenceField">—</div>
+                                </div>
+                                <div class="form-group" style="grid-column: span 2;">
+                                    <label>凭证头文本</label>
+                                    <div class="read-only-field" id="headerTextField">—</div>
+                                </div>
+                                <div class="form-group">
+                                    <label>置信度</label>
+                                    <div class="read-only-field" id="confidenceField">—</div>
+                                </div>
+                            </div>
+                            <div class="warnings-bar" id="warningsBar" style="display: none;"></div>
+
+                            <div class="voucher-table-wrapper">
+                                <table class="voucher-table">
+                                    <thead>
+                                        <tr>
+                                            <th class="col-no">行号</th>
+                                            <th class="col-acct">科目代码</th>
+                                            <th class="col-name">科目名称</th>
+                                            <th class="col-dc">借/贷</th>
+                                            <th class="col-amt">借方金额</th>
+                                            <th class="col-amt">贷方金额</th>
+                                            <th class="col-cur">币种</th>
+                                            <th class="col-code">客户编码</th>
+                                            <th class="col-name">客户名称</th>
+                                            <th class="col-code">税码</th>
+                                            <th class="col-code">利润中心</th>
+                                            <th class="col-code">成本中心</th>
+                                            <th class="col-code">分配</th>
+                                            <th class="col-text">摘要</th>
+                                            <th></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="voucherRows">
+                                        <!-- Rows will be injected here -->
+                                    </tbody>
+                                    <tfoot>
+                                        <tr class="total-row">
+                                            <td colspan="4">合计</td>
+                                            <td id="totalDebit">0.00</td>
+                                            <td id="totalCredit">0.00</td>
+                                            <td colspan="9"></td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Voucher Rules -->
+            <div class="tab-content" id="tabContentRules">
+                <div class="rules-container" id="rulesContainer">
+                    <div class="rules-loading" id="rulesLoading">
+                        <i class="ph ph-spinner ph-spin"></i> 加载凭证规则中...
+                    </div>
+                    <div class="rules-empty" id="rulesEmpty" style="display:none;">
+                        <i class="ph ph-warning-circle"></i> 暂无凭证规则配置
+                    </div>
+                    <div class="rules-list" id="rulesList" style="display:none;">
+                        <!-- Rule cards will be injected here -->
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="script.js?v=8"></script>
+</body>
+
+</html>
