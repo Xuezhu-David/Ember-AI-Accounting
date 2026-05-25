@@ -451,6 +451,9 @@ async def chat(payload: dict, request: Request):
         msg_lower = message.lower()
         voucher_keywords = ["查看凭证", "凭证记录", "我的凭证", "凭证列表", "已生成凭证", "看看凭证", "查凭证"]
         user_mgmt_keywords = ["添加用户", "新建用户", "创建用户", "增加用户"]
+        rule_mgmt_keywords = ["新增规则", "添加规则", "创建规则", "建立规则", "修改规则", "更新规则", "删除规则", "去掉规则",
+                              "新增凭证规则", "添加凭证规则", "创建凭证规则"]
+        rule_mgmt_action_keywords = ["新增", "添加", "创建", "建立", "修改", "更新", "删除", "去掉"]
         # Business type keywords for rule_query context fallback
         biz_type_map = {
             "销售收入": "sales_revenue", "销售": "sales_revenue",
@@ -478,6 +481,27 @@ async def chat(payload: dict, request: Request):
             # Override intent to user_mgmt
             parse_result = {"intent": "user_mgmt", "action": "create", "new_username": None, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → user_mgmt for '%s'", message[:60])
+
+        elif any(kw in msg_lower for kw in rule_mgmt_keywords):
+            # Override intent to rule_mgmt
+            # Try to detect rule_type from the message
+            detected_type = None
+            for kw, biz_type in biz_type_map.items():
+                if kw in msg_lower:
+                    detected_type = biz_type
+                    break
+            parse_result = {"intent": "rule_mgmt", "action": "create", "rule_type": detected_type, "reply": "", "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → rule_mgmt (type=%s) for '%s'", detected_type, message[:60])
+
+        elif any(kw in msg_lower for kw in rule_mgmt_action_keywords) and "规则" in msg_lower:
+            # "新增费用报销的规则" — action keyword + 规则
+            detected_type = None
+            for kw, biz_type in biz_type_map.items():
+                if kw in msg_lower:
+                    detected_type = biz_type
+                    break
+            parse_result = {"intent": "rule_mgmt", "action": "create", "rule_type": detected_type, "reply": "", "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → rule_mgmt (type=%s) for '%s'", detected_type, message[:60])
 
         elif last_assistant_is_rule_prompt:
             # Context: previous message asked which rule type → this message is a selection
@@ -614,6 +638,81 @@ async def chat(payload: dict, request: Request):
             "rule_type": rule_type,
             "view": "rules",
         })
+
+    # Handle rule_mgmt intent — create/update/delete voucher rules
+    if parse_result.get("intent") == "rule_mgmt":
+        action = parse_result.get("action", "create")
+        rule_type = parse_result.get("rule_type")
+        reply = parse_result.get("reply", "")
+
+        biz_type_labels = {
+            "sales_revenue": "销售收入",
+            "expense": "费用报销",
+            "asset_purchase": "资产采购",
+            "salary": "工资薪酬",
+            "loan": "借款/还款",
+        }
+
+        if not rule_type:
+            if not reply:
+                reply = "请告诉我要管理哪种业务类型的规则？可选类型：\n• 销售收入\n• 费用报销\n• 资产采购\n• 工资薪酬\n• 借款/还款"
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+            )
+            return JSONResponse({"reply": reply, "session_id": session_id})
+
+        biz_label = biz_type_labels.get(rule_type, rule_type)
+
+        if action == "create":
+            # Check admin permission
+            if user["role"] != "admin":
+                reply = f"抱歉，只有管理员才能创建凭证规则。"
+                await save_chat_message(
+                    session_id=chat_session_id, user_id=user["id"],
+                    role="assistant", content=reply, message_type="chat",
+                )
+                return JSONResponse({"reply": reply, "session_id": session_id})
+
+            if not reply:
+                reply = (
+                    f"好的，我来帮你创建「{biz_label}」类型的凭证规则。\n\n"
+                    "请提供以下信息：\n"
+                    "1. **产品类型**：software / service / saas / goods / *（全部）\n"
+                    "2. **税率**：0.13 / 0.06 / 0.00 / *（全部）\n"
+                    "3. **记账分录**：每行的借贷方向、科目代码、科目名称、金额取值字段\n\n"
+                    "示例：「产品类型 service，税率 0.06，借方 6001 主营业务收入 不含税金额，贷方 2221.01 应交增值税 税额」"
+                )
+
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+                metadata={"action": "rule_mgmt_create", "rule_type": rule_type},
+            )
+
+            await add_audit_log(
+                action="rule.create_start",
+                user_id=user["id"],
+                username=user["username"],
+                target_type="rule",
+                details={"rule_type": rule_type},
+            )
+
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+                "view": "rules",
+                "rule_mgmt": {"action": "create", "rule_type": rule_type},
+            })
+
+        # update / delete — placeholder
+        if not reply:
+            reply = f"「{biz_label}」规则的{action}功能正在开发中，敬请期待。"
+        await save_chat_message(
+            session_id=chat_session_id, user_id=user["id"],
+            role="assistant", content=reply, message_type="chat",
+        )
+        return JSONResponse({"reply": reply, "session_id": session_id})
 
     # Handle voucher_query intent — show user's voucher records
     if parse_result.get("intent") == "voucher_query":
@@ -1290,7 +1389,8 @@ NL_PARSE_SYSTEM_PROMPT = """\
 ## 意图判断规则
 
 - business：用户在描述一笔具体的财务/业务交易（如「卖软件给XX公司」「请客户吃饭花了560元」「采购了一台服务器」）
-- rule_query：用户在询问凭证规则/记账规则（如「凭证规则是什么」「我想看销售收入凭证怎么记」「费用报销怎么入账」「凭证规则」）
+- rule_query：用户在查看/查询凭证规则（如「凭证规则是什么」「我想看销售收入凭证怎么记」「费用报销怎么入账」「凭证规则」「查看规则」）
+- rule_mgmt：用户想新增/修改/删除凭证规则（如「新增费用报销的规则」「添加一条资产采购规则」「修改销售收入规则」「删除借款规则」）。关键词特征：新增、添加、创建、建立、修改、更新、删除、去掉
 - voucher_query：用户想查看已生成的凭证记录（如「查看我的凭证」「我生成的凭证有哪些」「凭证记录」「看看凭证」）
 - user_mgmt：管理员想通过对话添加或管理用户（如「添加一个用户」「新建用户张三」「添加普通用户李四密码123456」）
 - chat：用户在提问、闲聊、求助或与系统对话（如「你好」「你能做什么？」「什么是增值税？」）
@@ -1356,6 +1456,20 @@ status 的可选值：draft / posted / null
 ```
 如果用户明确指定了业务类型，rule_type 填对应的值，reply 中确认并说明即将展示该类型的规则。
 如果用户没有指定具体类型，rule_type 填 null，reply 中列出可查看规则的凭证类型，引导用户选择。
+
+### intent=rule_mgmt 时：
+```json
+{
+  "intent": "rule_mgmt",
+  "action": "create / update / delete",
+  "rule_type": "sales_revenue / expense / asset_purchase / salary / loan",
+  "reply": "对用户管理规则的确认或引导回复"
+}
+```
+注意区分 rule_query 和 rule_mgmt：
+- 「查看/查询/显示/看看」→ rule_query
+- 「新增/添加/创建/建立/修改/更新/删除/去掉」→ rule_mgmt
+例如「新增费用报销的规则」→ intent=rule_mgmt, action=create, rule_type=expense
 
 ### intent=voucher_query 时：
 ```json
@@ -1461,6 +1575,16 @@ async def _parse_transaction_from_nl(message: str, history: list[dict] | None = 
         if intent == "rule_query":
             return {
                 "intent": "rule_query",
+                "rule_type": data.get("rule_type"),
+                "reply": data.get("reply", ""),
+                "business_type": None,
+                "transaction": None,
+            }
+
+        if intent == "rule_mgmt":
+            return {
+                "intent": "rule_mgmt",
+                "action": data.get("action", "create"),
                 "rule_type": data.get("rule_type"),
                 "reply": data.get("reply", ""),
                 "business_type": None,
