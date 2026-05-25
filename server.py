@@ -155,6 +155,23 @@ def _get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
     return sid, session
 
 
+# Session timeout: 2 hours (in seconds)
+SESSION_TIMEOUT_HOURS = 2
+
+
+async def _is_session_expired(session_id: str) -> bool:
+    """Check if a session has been inactive for too long."""
+    from datetime import datetime, timedelta
+    recent = await list_chat_messages(session_id=session_id, limit=1)
+    if not recent:
+        return False  # No messages yet, not expired
+    last_msg = recent[0]
+    last_time = datetime.fromisoformat(last_msg["created_at"])
+    if datetime.utcnow() - last_time > timedelta(hours=SESSION_TIMEOUT_HOURS):
+        return True
+    return False
+
+
 # ── Helper: voucher ↔ JSON serialisable dict ─────────────────────────────────
 
 
@@ -413,6 +430,12 @@ async def chat(payload: dict, request: Request):
     user = await _require_auth(request)
     message = payload.get("message", "").strip()
     session_id = payload.get("session_id")
+
+    # Session timeout: if session inactive for > SESSION_TIMEOUT_HOURS, start new session
+    if session_id and await _is_session_expired(session_id):
+        logger.info("Session %s expired (inactive > %dh), creating new session", session_id, SESSION_TIMEOUT_HOURS)
+        session_id = None
+
     chat_session_id = session_id or str(uuid.uuid4())
     session_id, session = _get_session(session_id)
 
@@ -433,8 +456,8 @@ async def chat(payload: dict, request: Request):
 
     # Build a synthetic SalesTransaction from the natural language via LLM
     # Pass recent conversation history so LLM can understand context
-    # DeepSeek V4 Pro supports 1M context; use 20 messages (10 turns) for good balance
-    recent_history = await list_chat_messages(session_id=chat_session_id, limit=20)
+    # DeepSeek V4 Pro supports 1M context; use 200 messages (100 turns)
+    recent_history = await list_chat_messages(session_id=chat_session_id, limit=200)
     history_for_llm = [{"role": m["role"], "content": m["content"]} for m in recent_history]
     parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
@@ -1543,7 +1566,7 @@ async def _parse_transaction_from_nl(message: str, history: list[dict] | None = 
     # Build message list with conversation history for context
     messages = [{"role": "system", "content": NL_PARSE_SYSTEM_PROMPT}]
     if history:
-        for msg in history[-20:]:  # Last 10 turns (user + assistant pairs)
+        for msg in history[-200:]:  # Last 100 turns (user + assistant pairs)
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_prompt})
 
