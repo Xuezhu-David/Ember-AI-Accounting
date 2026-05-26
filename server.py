@@ -29,7 +29,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import agentscope
 from agentscope.message import Msg
 from agents.agent_config import AGENT_NAME, AGENT_CAPABILITIES
 from agents.intent_agent import IntentAgent
@@ -293,12 +292,11 @@ async def startup():
     if migrated:
         logger.info("Migrated %d rules from Excel to database", migrated)
 
-    # Initialize AgentScope agents
-    agentscope.init(project="EmberAI", name="accounting_server")
+    # Initialize agents
     app.state.intent_agent = IntentAgent("intent_agent")
     app.state.voucher_agent = VoucherAgent("voucher_agent")
     app.state.ocr_agent = OcrAgent("ocr_agent")
-    logger.info("AgentScope agents initialized")
+    logger.info("Agents initialized")
 
 
 # ── API: Auth ─────────────────────────────────────────────────────────────────

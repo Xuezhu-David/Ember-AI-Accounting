@@ -7,8 +7,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
+from agentscope.message import Msg, UserMsg, SystemMsg, DataBlock, TextBlock, Base64Source
 
 from prompts import IMAGE_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
@@ -18,28 +17,14 @@ from .model_factory import create_chat_model
 logger = logging.getLogger(__name__)
 
 
-class OcrAgent(AgentBase):
+class OcrAgent:
     """Extract structured transaction data from invoice images or PDFs."""
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self.name = name
         self.model = create_chat_model(vision=True)
-        self.history: list[Msg] = []
 
-    async def observe(self, msg: Msg | list[Msg] | None) -> None:
-        if msg is None:
-            return
-        if isinstance(msg, list):
-            self.history.extend(msg)
-        else:
-            self.history.append(msg)
-
-    async def reply(self, msg: Msg | None = None) -> Msg:
-        await self.observe(msg)
-        if msg is None:
-            return Msg(name=self.name, role="assistant", content="{}")
-
+    async def reply(self, msg: Msg) -> Msg:
         file_path = Path(msg.metadata.get("file_path", "")) if msg.metadata else Path()
         file_type = msg.metadata.get("file_type", "image") if msg.metadata else "image"
 
@@ -52,14 +37,12 @@ class OcrAgent(AgentBase):
             logger.error("OcrAgent parse failed: %s", exc)
             result_data = None
 
-        result = Msg(
+        return Msg(
             name=self.name,
             role="assistant",
             content=json.dumps(result_data, ensure_ascii=False, default=str) if result_data else "{}",
             metadata={"ocr_result": result_data},
         )
-        await self.print(result)
-        return result
 
     async def _parse_image(self, image_path: Path) -> dict | None:
         """Parse a single image file."""
@@ -74,15 +57,12 @@ class OcrAgent(AgentBase):
         mime_type = mime_map.get(ext, "image/jpeg")
         today = date.today().strftime("%Y-%m-%d")
 
-        messages = [
-            {"role": "system", "content": IMAGE_PARSE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
-                    {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"},
-                ],
-            },
+        messages: list[Msg] = [
+            SystemMsg(name="system", content=IMAGE_PARSE_SYSTEM_PROMPT),
+            UserMsg(name="user", content=[
+                DataBlock(source=Base64Source(data=b64_image, media_type=mime_type)),
+                TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"),
+            ]),
         ]
 
         response = await self.model(messages)
@@ -96,27 +76,20 @@ class OcrAgent(AgentBase):
             return None
 
         today = date.today().strftime("%Y-%m-%d")
-        image_blocks = []
+        blocks = []
         for img_bytes, mime_type in pages:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
-            image_blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-            })
+            blocks.append(DataBlock(source=Base64Source(data=b64, media_type=mime_type)))
 
         page_note = ""
         if len(pages) > 1:
             page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
 
-        messages = [
-            {"role": "system", "content": IMAGE_PARSE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    *image_blocks,
-                    {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"},
-                ],
-            },
+        blocks.append(TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"))
+
+        messages: list[Msg] = [
+            SystemMsg(name="system", content=IMAGE_PARSE_SYSTEM_PROMPT),
+            UserMsg(name="user", content=blocks),
         ]
 
         response = await self.model(messages)

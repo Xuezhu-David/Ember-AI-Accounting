@@ -1,4 +1,4 @@
-agentscope==1.0.20
+agentscope==2.0.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 openai>=1.0

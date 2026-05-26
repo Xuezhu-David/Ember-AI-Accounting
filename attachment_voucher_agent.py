@@ -5,7 +5,6 @@ from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
-from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from excel_loader import load_sales_transactions
@@ -14,11 +13,10 @@ from sap_exporter import export_sap_csv
 from voucher_models import Voucher
 
 
-class AttachmentVoucherAgent(AgentBase):
+class AttachmentVoucherAgent:
     """Parse attachment instructions and produce accounting voucher drafts using LLM."""
 
     def __init__(self, name: str, output_dir: str | Path = "data/output") -> None:
-        super().__init__()
         self.name = name
         self.output_dir = Path(output_dir)
         self.history: list[Msg] = []
@@ -41,7 +39,7 @@ class AttachmentVoucherAgent(AgentBase):
         else:
             result = await self._handle_request(msg)
 
-        response = Msg(
+        return Msg(
             name=self.name,
             role="assistant",
             content=json.dumps(result, ensure_ascii=False, indent=2, default=_json_default),
@@ -50,8 +48,6 @@ class AttachmentVoucherAgent(AgentBase):
                 "voucher_count": len(self.generated_vouchers),
             },
         )
-        await self.print(response)
-        return response
 
     async def _handle_request(self, msg: Msg) -> dict:
         request = json.loads(msg.get_text_content() or "{}")

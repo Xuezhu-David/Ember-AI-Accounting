@@ -14,7 +14,6 @@ from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
-import agentscope
 from agentscope.message import Msg
 
 from accounting_agent import AccountingVoucherAgent
@@ -55,11 +54,6 @@ def json_default(value: object) -> str:
 
 
 async def main() -> None:
-    agentscope.init(
-        project="AIAccountingVoucherDemo",
-        name="llm_sales_revenue_to_sap_voucher",
-    )
-
     agent = AccountingVoucherAgent("sales_revenue_voucher_agent")
     transaction = sample_sales_transaction()
     request = Msg(

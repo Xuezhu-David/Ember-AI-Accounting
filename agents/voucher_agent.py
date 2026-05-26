@@ -4,7 +4,6 @@ import json
 import logging
 from dataclasses import asdict
 
-from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from llm_voucher_generator import LLMVoucherGenerator
@@ -13,33 +12,19 @@ from voucher_models import SalesTransaction
 logger = logging.getLogger(__name__)
 
 
-class VoucherAgent(AgentBase):
+class VoucherAgent:
     """Generate accounting voucher drafts from SalesTransaction data."""
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self.name = name
         self._generator = LLMVoucherGenerator()
-        self.history: list[Msg] = []
 
-    async def observe(self, msg: Msg | list[Msg] | None) -> None:
-        if msg is None:
-            return
-        if isinstance(msg, list):
-            self.history.extend(msg)
-        else:
-            self.history.append(msg)
-
-    async def reply(self, msg: Msg | None = None) -> Msg:
-        await self.observe(msg)
-        if msg is None:
-            return Msg(name=self.name, role="assistant", content="{}")
-
+    async def reply(self, msg: Msg) -> Msg:
         try:
             txn = self._extract_transaction(msg)
             voucher = await self._generator.generate(txn)
             voucher_dict = _voucher_to_dict(voucher)
-            result = Msg(
+            return Msg(
                 name=self.name,
                 role="assistant",
                 content=json.dumps(voucher_dict, ensure_ascii=False, default=str),
@@ -47,22 +32,19 @@ class VoucherAgent(AgentBase):
             )
         except Exception as exc:
             logger.error("VoucherAgent generation failed: %s", exc)
-            result = Msg(
+            return Msg(
                 name=self.name,
                 role="assistant",
                 content="{}",
                 metadata={"status": "error", "error": str(exc)},
             )
 
-        await self.print(result)
-        return result
-
     def _extract_transaction(self, msg: Msg) -> SalesTransaction:
         """Extract SalesTransaction from message content or metadata."""
         if msg.metadata and "transaction" in msg.metadata:
             return msg.metadata["transaction"]
 
-        data = json.loads(msg.get_text_content())
+        data = json.loads(msg.get_text_content() or "{}")
         from decimal import Decimal
         return SalesTransaction(
             transaction_id=data["transaction_id"],

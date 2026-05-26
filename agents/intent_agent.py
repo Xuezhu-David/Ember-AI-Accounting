@@ -5,42 +5,26 @@ import logging
 from datetime import date
 from decimal import Decimal
 
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
+from agentscope.message import Msg, UserMsg, SystemMsg
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
 
 from .agent_config import IDENTITY_CONTEXT, AGENT_NAME, AGENT_CAPABILITIES
-from .model_factory import create_chat_model, create_formatter
+from .model_factory import create_chat_model
 
 logger = logging.getLogger(__name__)
 
 
-class IntentAgent(AgentBase):
+class IntentAgent:
     """Classify user intent and extract business data from natural language."""
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self.name = name
         self.model = create_chat_model()
-        self.formatter = create_formatter()
-        self.history: list[Msg] = []
 
-    async def observe(self, msg: Msg | list[Msg] | None) -> None:
-        if msg is None:
-            return
-        if isinstance(msg, list):
-            self.history.extend(msg)
-        else:
-            self.history.append(msg)
-
-    async def reply(self, msg: Msg | None = None) -> Msg:
-        await self.observe(msg)
-        if msg is None:
-            return Msg(name=self.name, role="assistant", content="{}")
-
-        message = msg.get_text_content()
+    async def reply(self, msg: Msg) -> Msg:
+        message = msg.get_text_content() or ""
         conversation_history = msg.metadata.get("history", []) if msg.metadata else []
 
         today = date.today().strftime("%Y-%m-%d")
@@ -49,12 +33,17 @@ class IntentAgent(AgentBase):
             "请先判断用户意图（intent），再进行后续处理。"
         )
 
-        # Build messages for the LLM
+        # Build messages for the LLM (2.0 uses list[Msg])
         system_prompt = NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT
-        messages = [{"role": "system", "content": system_prompt}]
+        messages: list[Msg] = [SystemMsg(name="system", content=system_prompt)]
         for hist_msg in conversation_history[-200:]:
-            messages.append({"role": hist_msg["role"], "content": hist_msg["content"]})
-        messages.append({"role": "user", "content": user_prompt})
+            role = hist_msg.get("role", "user")
+            content = hist_msg.get("content", "")
+            if role == "assistant":
+                messages.append(Msg(name="assistant", role="assistant", content=content))
+            else:
+                messages.append(UserMsg(name="user", content=content))
+        messages.append(UserMsg(name="user", content=user_prompt))
 
         try:
             response = await self.model(messages)
@@ -74,14 +63,12 @@ class IntentAgent(AgentBase):
                 "transaction": None,
             }
 
-        result = Msg(
+        return Msg(
             name=self.name,
             role="assistant",
-            content=json.dumps(parse_result, ensure_ascii=False, default=str) if parse_result else "{}",
+            content=json.dumps(parse_result, ensure_ascii=False, default=str),
             metadata={"parse_result": parse_result},
         )
-        await self.print(result)
-        return result
 
     def _parse_response(self, raw: str, today: str) -> dict | None:
         """Parse LLM response JSON into a structured result."""
@@ -96,6 +83,7 @@ class IntentAgent(AgentBase):
         except json.JSONDecodeError:
             logger.warning("Failed to parse LLM response as JSON: %s", raw[:200])
             return None
+
         intent = data.get("intent", "unknown")
 
         if intent == "chat":

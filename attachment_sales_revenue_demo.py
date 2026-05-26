@@ -11,7 +11,6 @@ import asyncio
 import json
 from pathlib import Path
 
-import agentscope
 from agentscope.message import Msg
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -118,11 +117,6 @@ def create_sample_sales_excel(path: Path) -> None:
 
 
 async def main() -> None:
-    agentscope.init(
-        project="AIAccountingVoucherDemo",
-        name="llm_instruction_with_excel_attachment",
-    )
-
     create_sample_sales_excel(INPUT_PATH)
 
     request = {

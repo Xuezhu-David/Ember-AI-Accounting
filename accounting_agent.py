@@ -4,18 +4,16 @@ import json
 from dataclasses import asdict
 from decimal import Decimal
 
-from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from llm_voucher_generator import LLMVoucherGenerator
 from voucher_models import SalesTransaction, Voucher
 
 
-class AccountingVoucherAgent(AgentBase):
+class AccountingVoucherAgent:
     """Generate accounting voucher drafts from normalized business records using LLM."""
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self.name = name
         self.history: list[Msg] = []
         self.generated_vouchers: list[Voucher] = []
@@ -50,7 +48,7 @@ class AccountingVoucherAgent(AgentBase):
             )
         )
 
-        response = Msg(
+        return Msg(
             name=self.name,
             role="assistant",
             content=content,
@@ -59,8 +57,6 @@ class AccountingVoucherAgent(AgentBase):
                 "voucher_count": len(self.generated_vouchers),
             },
         )
-        await self.print(response)
-        return response
 
     def _transaction_from_message(self, msg: Msg) -> SalesTransaction:
         payload = json.loads(msg.get_text_content() or "{}")

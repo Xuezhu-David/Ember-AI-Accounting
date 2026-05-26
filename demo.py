@@ -7,16 +7,13 @@ Run:
 
 import asyncio
 
-import agentscope
-from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 
-class EchoAgent(AgentBase):
+class EchoAgent:
     """A tiny local agent for checking the AgentScope runtime."""
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self.name = name
         self.history: list[Msg] = []
 
@@ -42,13 +39,10 @@ class EchoAgent(AgentBase):
             ),
         )
 
-        await self.print(response)
         return response
 
 
 async def main() -> None:
-    agentscope.init(project="AgentScopeStdDemo", name="local_echo_demo")
-
     agent = EchoAgent("local_echo_agent")
     user_msg = Msg(
         name="user",
