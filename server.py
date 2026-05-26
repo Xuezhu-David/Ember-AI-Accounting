@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from agentscope.message import Msg
+from agentscope.message import Msg, UserMsg
 from agents.agent_config import AGENT_NAME, AGENT_CAPABILITIES
 from agents.intent_agent import IntentAgent
 from agents.voucher_agent import VoucherAgent
@@ -562,7 +562,7 @@ async def chat(payload: dict, request: Request):
                     logger.info("Pending action: continuing %s (type=%s) for '%s'", pending, detected_type, message[:60])
 
     if parse_result is None:
-        intent_msg = Msg(name="user", role="user", content=message, metadata={"history": history_for_llm})
+        intent_msg = UserMsg(name="user", content=message, metadata={"history": history_for_llm})
         intent_result_msg = await app.state.intent_agent.reply(intent_msg)
         parse_result = intent_result_msg.metadata.get("parse_result") if intent_result_msg.metadata else None
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
@@ -987,7 +987,7 @@ async def chat(payload: dict, request: Request):
             "session_id": session_id,
         })
 
-    voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+    voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
     voucher_result = await app.state.voucher_agent.reply(voucher_msg)
     voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
     if not voucher:
@@ -1084,7 +1084,7 @@ async def upload_file(
     # ── Image / PDF path: use multimodal LLM for OCR ──
     if suffix in IMAGE_EXTENSIONS or suffix in PDF_EXTENSIONS:
         file_type = "pdf" if suffix in PDF_EXTENSIONS else "image"
-        ocr_msg = Msg(name="user", role="user", content="", metadata={"file_path": str(saved_path), "file_type": file_type})
+        ocr_msg = UserMsg(name="user", content="", metadata={"file_path": str(saved_path), "file_type": file_type})
         ocr_result_msg = await app.state.ocr_agent.reply(ocr_msg)
         result = ocr_result_msg.metadata.get("ocr_result") if ocr_result_msg.metadata else None
 
@@ -1119,7 +1119,7 @@ async def upload_file(
                 "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             })
 
-        voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
         voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
         if not voucher:
@@ -1179,7 +1179,7 @@ async def upload_file(
 
     vouchers = []
     for txn in transactions:
-        voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
         voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
         if not voucher:

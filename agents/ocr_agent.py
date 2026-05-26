@@ -3,11 +3,21 @@
 import base64
 import json
 import logging
+import uuid
+from collections.abc import AsyncGenerator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from agentscope.message import Msg, UserMsg, SystemMsg, DataBlock, TextBlock, Base64Source
+from agentscope.event import (
+    EventBase,
+    ReplyStartEvent,
+    ReplyEndEvent,
+    TextBlockStartEvent,
+    TextBlockDeltaEvent,
+    TextBlockEndEvent,
+)
+from agentscope.message import Msg, UserMsg, SystemMsg, AssistantMsg, DataBlock, TextBlock, Base64Source
 
 from prompts import IMAGE_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
@@ -25,8 +35,20 @@ class OcrAgent:
         self.model = create_chat_model(vision=True)
 
     async def reply(self, msg: Msg) -> Msg:
+        final = None
+        async for event in self.reply_stream(msg, session_id=""):
+            if isinstance(event, ReplyStartEvent):
+                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
+            if final is not None:
+                final.append_event(event)
+        return final  # type: ignore[return-value]
+
+    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
         file_path = Path(msg.metadata.get("file_path", "")) if msg.metadata else Path()
         file_type = msg.metadata.get("file_type", "image") if msg.metadata else "image"
+
+        msg_id = str(uuid.uuid4())
+        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
 
         try:
             if file_type == "pdf":
@@ -37,12 +59,19 @@ class OcrAgent:
             logger.error("OcrAgent parse failed: %s", exc)
             result_data = None
 
-        return Msg(
+        text = json.dumps(result_data, ensure_ascii=False, default=str) if result_data else "{}"
+        result_msg = AssistantMsg(
             name=self.name,
-            role="assistant",
-            content=json.dumps(result_data, ensure_ascii=False, default=str) if result_data else "{}",
+            content=text,
+            id=msg_id,
             metadata={"ocr_result": result_data},
         )
+
+        block_id = str(uuid.uuid4())
+        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
+        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
 
     async def _parse_image(self, image_path: Path) -> dict | None:
         """Parse a single image file."""
@@ -66,7 +95,8 @@ class OcrAgent:
         ]
 
         response = await self.model(messages)
-        raw = response.get_text_content() or ""
+        result_msg = AssistantMsg(name=self.name, content=list(response.content))
+        raw = result_msg.get_text_content() or ""
         return self._parse_llm_response(raw, today)
 
     async def _parse_pdf(self, pdf_path: Path) -> dict | None:
@@ -93,7 +123,8 @@ class OcrAgent:
         ]
 
         response = await self.model(messages)
-        raw = response.get_text_content() or ""
+        result_msg = AssistantMsg(name=self.name, content=list(response.content))
+        raw = result_msg.get_text_content() or ""
         return self._parse_llm_response(raw, today)
 
     def _parse_llm_response(self, raw: str, today: str) -> dict | None:

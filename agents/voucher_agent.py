@@ -2,8 +2,18 @@
 
 import json
 import logging
+import uuid
+from collections.abc import AsyncGenerator
 
-from agentscope.message import Msg
+from agentscope.event import (
+    EventBase,
+    ReplyStartEvent,
+    ReplyEndEvent,
+    TextBlockStartEvent,
+    TextBlockDeltaEvent,
+    TextBlockEndEvent,
+)
+from agentscope.message import Msg, AssistantMsg
 
 from llm_voucher_generator import LLMVoucherGenerator
 from voucher_models import SalesTransaction
@@ -19,24 +29,36 @@ class VoucherAgent:
         self._generator = LLMVoucherGenerator()
 
     async def reply(self, msg: Msg) -> Msg:
+        final = None
+        async for event in self.reply_stream(msg, session_id=""):
+            if isinstance(event, ReplyStartEvent):
+                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
+            if final is not None:
+                final.append_event(event)
+        return final  # type: ignore[return-value]
+
+    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
+        msg_id = str(uuid.uuid4())
+        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
+
         try:
             txn = self._extract_transaction(msg)
             voucher = await self._generator.generate(txn)
             voucher_dict = _voucher_to_dict(voucher)
-            return Msg(
-                name=self.name,
-                role="assistant",
-                content=json.dumps(voucher_dict, ensure_ascii=False, default=str),
-                metadata={"status": "generated", "voucher": voucher},
-            )
+            text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
+            metadata = {"status": "generated", "voucher": voucher}
         except Exception as exc:
             logger.error("VoucherAgent generation failed: %s", exc)
-            return Msg(
-                name=self.name,
-                role="assistant",
-                content="{}",
-                metadata={"status": "error", "error": str(exc)},
-            )
+            text = "{}"
+            metadata = {"status": "error", "error": str(exc)}
+
+        result_msg = AssistantMsg(name=self.name, content=text, id=msg_id, metadata=metadata)
+
+        block_id = str(uuid.uuid4())
+        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
+        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
 
     def _extract_transaction(self, msg: Msg) -> SalesTransaction:
         """Extract SalesTransaction from message content or metadata."""

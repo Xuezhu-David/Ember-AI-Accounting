@@ -2,10 +2,20 @@
 
 import json
 import logging
+import uuid
+from collections.abc import AsyncGenerator
 from datetime import date
 from decimal import Decimal
 
-from agentscope.message import Msg, UserMsg, SystemMsg
+from agentscope.event import (
+    EventBase,
+    ReplyStartEvent,
+    ReplyEndEvent,
+    TextBlockStartEvent,
+    TextBlockDeltaEvent,
+    TextBlockEndEvent,
+)
+from agentscope.message import Msg, UserMsg, SystemMsg, AssistantMsg
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
@@ -24,6 +34,15 @@ class IntentAgent:
         self.model = create_chat_model()
 
     async def reply(self, msg: Msg) -> Msg:
+        final = None
+        async for event in self.reply_stream(msg, session_id=""):
+            if isinstance(event, ReplyStartEvent):
+                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
+            if final is not None:
+                final.append_event(event)
+        return final  # type: ignore[return-value]
+
+    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
         message = msg.get_text_content() or ""
         conversation_history = msg.metadata.get("history", []) if msg.metadata else []
 
@@ -33,28 +52,30 @@ class IntentAgent:
             "请先判断用户意图（intent），再进行后续处理。"
         )
 
-        # Build messages for the LLM (2.0 uses list[Msg])
         system_prompt = NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT
         messages: list[Msg] = [SystemMsg(name="system", content=system_prompt)]
         for hist_msg in conversation_history[-200:]:
             role = hist_msg.get("role", "user")
             content = hist_msg.get("content", "")
             if role == "assistant":
-                messages.append(Msg(name="assistant", role="assistant", content=content))
+                messages.append(AssistantMsg(name="assistant", content=content))
             else:
                 messages.append(UserMsg(name="user", content=content))
         messages.append(UserMsg(name="user", content=user_prompt))
 
+        msg_id = str(uuid.uuid4())
+        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
+
         try:
             response = await self.model(messages)
-            raw = response.get_text_content() or ""
+            result_msg = AssistantMsg(name=self.name, content=list(response.content), id=msg_id)
+            raw = result_msg.get_text_content() or ""
             logger.info("IntentAgent raw response: %s", raw[:300])
             parse_result = self._parse_response(raw, today)
         except Exception as exc:
             logger.error("IntentAgent LLM call failed: %s", exc)
             parse_result = None
 
-        # Fallback: if parsing failed, treat as chat with a friendly reply
         if parse_result is None:
             parse_result = {
                 "intent": "chat",
@@ -63,12 +84,19 @@ class IntentAgent:
                 "transaction": None,
             }
 
-        return Msg(
+        text = json.dumps(parse_result, ensure_ascii=False, default=str)
+        result_msg = AssistantMsg(
             name=self.name,
-            role="assistant",
-            content=json.dumps(parse_result, ensure_ascii=False, default=str),
+            content=text,
+            id=msg_id,
             metadata={"parse_result": parse_result},
         )
+
+        block_id = str(uuid.uuid4())
+        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
+        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
 
     def _parse_response(self, raw: str, today: str) -> dict | None:
         """Parse LLM response JSON into a structured result."""
