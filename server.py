@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from agentscope.message import Msg, UserMsg
+from agentscope.message import Msg, UserMsg, AssistantMsg
 from agents.agent_config import AGENT_NAME, AGENT_CAPABILITIES
 from agents.intent_agent import IntentAgent
 from agents.voucher_agent import VoucherAgent
@@ -562,7 +562,14 @@ async def chat(payload: dict, request: Request):
                     logger.info("Pending action: continuing %s (type=%s) for '%s'", pending, detected_type, message[:60])
 
     if parse_result is None:
-        intent_msg = UserMsg(name="user", content=message, metadata={"history": history_for_llm})
+        for hist in history_for_llm[-200:]:
+            role = hist.get("role", "user")
+            content = hist.get("content", "")
+            if role == "assistant":
+                await app.state.intent_agent.observe(AssistantMsg(name="assistant", content=content))
+            else:
+                await app.state.intent_agent.observe(UserMsg(name="user", content=content))
+        intent_msg = UserMsg(name="user", content=message)
         intent_result_msg = await app.state.intent_agent.reply(intent_msg)
         parse_result = intent_result_msg.metadata.get("parse_result") if intent_result_msg.metadata else None
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)

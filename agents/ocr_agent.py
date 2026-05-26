@@ -3,16 +3,14 @@
 import base64
 import json
 import logging
-import uuid
-from collections.abc import AsyncGenerator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+from agentscope.agent import Agent
 from agentscope.event import (
-    EventBase,
-    ReplyStartEvent,
-    ReplyEndEvent,
+    ModelCallStartEvent,
+    ModelCallEndEvent,
     TextBlockStartEvent,
     TextBlockDeltaEvent,
     TextBlockEndEvent,
@@ -27,105 +25,70 @@ from .model_factory import create_chat_model
 logger = logging.getLogger(__name__)
 
 
-class OcrAgent:
+class OcrAgent(Agent):
     """Extract structured transaction data from invoice images or PDFs."""
 
     def __init__(self, name: str) -> None:
-        self.name = name
-        self.model = create_chat_model(vision=True)
+        super().__init__(
+            name=name,
+            system_prompt=IMAGE_PARSE_SYSTEM_PROMPT,
+            model=create_chat_model(vision=True),
+        )
+        self._file_path: Path = Path()
+        self._file_type: str = "image"
 
     async def reply(self, msg: Msg) -> Msg:
-        final = None
-        async for event in self.reply_stream(msg, session_id=""):
-            if isinstance(event, ReplyStartEvent):
-                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
-            if final is not None:
-                final.append_event(event)
-        return final  # type: ignore[return-value]
+        self._file_path = Path(msg.metadata.get("file_path", "")) if msg.metadata else Path()
+        self._file_type = msg.metadata.get("file_type", "image") if msg.metadata else "image"
+        return await super().reply(msg)
 
-    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
-        file_path = Path(msg.metadata.get("file_path", "")) if msg.metadata else Path()
-        file_type = msg.metadata.get("file_type", "image") if msg.metadata else "image"
+    async def _prepare_model_input(self) -> dict:
+        today = date.today().strftime("%Y-%m-%d")
 
-        msg_id = str(uuid.uuid4())
-        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
+        if self._file_type == "pdf":
+            blocks = _build_pdf_blocks(self._file_path, today)
+        else:
+            blocks = _build_image_blocks(self._file_path, today)
+
+        messages = [
+            SystemMsg(name="system", content=self._system_prompt),
+            UserMsg(name="user", content=blocks),
+        ]
+        return {"messages": messages, "tools": []}
+
+    async def _reasoning_impl(self, tool_choice=None):
+        yield ModelCallStartEvent(
+            reply_id=self.state.reply_id,
+            model_name=self.model.model,
+        )
+
+        kwargs = await self._prepare_model_input()
+        today = date.today().strftime("%Y-%m-%d")
 
         try:
-            if file_type == "pdf":
-                result_data = await self._parse_pdf(file_path)
-            else:
-                result_data = await self._parse_image(file_path)
+            response = await self._call_model(messages=kwargs["messages"], tools=[])
+            result_msg = AssistantMsg(name=self.name, content=list(response.content))
+            raw = result_msg.get_text_content() or ""
+            result_data = self._parse_llm_response(raw, today)
         except Exception as exc:
             logger.error("OcrAgent parse failed: %s", exc)
             result_data = None
 
         text = json.dumps(result_data, ensure_ascii=False, default=str) if result_data else "{}"
-        result_msg = AssistantMsg(
+
+        yield ModelCallEndEvent(reply_id=self.state.reply_id, input_tokens=0, output_tokens=0)
+
+        block_id = __import__("uuid").uuid4().hex
+        yield TextBlockStartEvent(reply_id=self.state.reply_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=self.state.reply_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=self.state.reply_id, block_id=block_id)
+
+        yield AssistantMsg(
+            id=self.state.reply_id,
             name=self.name,
             content=text,
-            id=msg_id,
             metadata={"ocr_result": result_data},
         )
-
-        block_id = str(uuid.uuid4())
-        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
-        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
-        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
-        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
-
-    async def _parse_image(self, image_path: Path) -> dict | None:
-        """Parse a single image file."""
-        image_bytes = image_path.read_bytes()
-        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-        ext = image_path.suffix.lower()
-        mime_map = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-        }
-        mime_type = mime_map.get(ext, "image/jpeg")
-        today = date.today().strftime("%Y-%m-%d")
-
-        messages: list[Msg] = [
-            SystemMsg(name="system", content=IMAGE_PARSE_SYSTEM_PROMPT),
-            UserMsg(name="user", content=[
-                DataBlock(source=Base64Source(data=b64_image, media_type=mime_type)),
-                TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"),
-            ]),
-        ]
-
-        response = await self.model(messages)
-        result_msg = AssistantMsg(name=self.name, content=list(response.content))
-        raw = result_msg.get_text_content() or ""
-        return self._parse_llm_response(raw, today)
-
-    async def _parse_pdf(self, pdf_path: Path) -> dict | None:
-        """Parse a PDF file (convert pages to images first)."""
-        pages = _pdf_to_images(pdf_path)
-        if not pages:
-            return None
-
-        today = date.today().strftime("%Y-%m-%d")
-        blocks = []
-        for img_bytes, mime_type in pages:
-            b64 = base64.b64encode(img_bytes).decode("utf-8")
-            blocks.append(DataBlock(source=Base64Source(data=b64, media_type=mime_type)))
-
-        page_note = ""
-        if len(pages) > 1:
-            page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
-
-        blocks.append(TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"))
-
-        messages: list[Msg] = [
-            SystemMsg(name="system", content=IMAGE_PARSE_SYSTEM_PROMPT),
-            UserMsg(name="user", content=blocks),
-        ]
-
-        response = await self.model(messages)
-        result_msg = AssistantMsg(name=self.name, content=list(response.content))
-        raw = result_msg.get_text_content() or ""
-        return self._parse_llm_response(raw, today)
 
     def _parse_llm_response(self, raw: str, today: str) -> dict | None:
         """Parse LLM JSON response into a structured result."""
@@ -163,6 +126,38 @@ class OcrAgent:
             cost_center=data.get("cost_center", "CC-DEFAULT"),
         )
         return {"business_type": business_type, "transaction": txn}
+
+
+def _build_image_blocks(image_path: Path, today: str) -> list:
+    image_bytes = image_path.read_bytes()
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    ext = image_path.suffix.lower()
+    mime_map = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    }
+    mime_type = mime_map.get(ext, "image/jpeg")
+
+    return [
+        DataBlock(source=Base64Source(data=b64_image, media_type=mime_type)),
+        TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"),
+    ]
+
+
+def _build_pdf_blocks(pdf_path: Path, today: str) -> list:
+    pages = _pdf_to_images(pdf_path)
+    blocks = []
+    for img_bytes, mime_type in pages:
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        blocks.append(DataBlock(source=Base64Source(data=b64, media_type=mime_type)))
+
+    page_note = ""
+    if len(pages) > 1:
+        page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
+
+    blocks.append(TextBlock(text=f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"))
+    return blocks
 
 
 def _pdf_to_images(pdf_path: Path) -> list[tuple[bytes, str]]:

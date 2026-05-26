@@ -2,20 +2,18 @@
 
 import json
 import logging
-import uuid
-from collections.abc import AsyncGenerator
 from datetime import date
 from decimal import Decimal
 
+from agentscope.agent import Agent
 from agentscope.event import (
-    EventBase,
-    ReplyStartEvent,
-    ReplyEndEvent,
+    ModelCallStartEvent,
+    ModelCallEndEvent,
     TextBlockStartEvent,
     TextBlockDeltaEvent,
     TextBlockEndEvent,
 )
-from agentscope.message import Msg, UserMsg, SystemMsg, AssistantMsg
+from agentscope.message import Msg, AssistantMsg
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
@@ -26,49 +24,28 @@ from .model_factory import create_chat_model
 logger = logging.getLogger(__name__)
 
 
-class IntentAgent:
+class IntentAgent(Agent):
     """Classify user intent and extract business data from natural language."""
 
     def __init__(self, name: str) -> None:
-        self.name = name
-        self.model = create_chat_model()
-
-    async def reply(self, msg: Msg) -> Msg:
-        final = None
-        async for event in self.reply_stream(msg, session_id=""):
-            if isinstance(event, ReplyStartEvent):
-                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
-            if final is not None:
-                final.append_event(event)
-        return final  # type: ignore[return-value]
-
-    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
-        message = msg.get_text_content() or ""
-        conversation_history = msg.metadata.get("history", []) if msg.metadata else []
-
-        today = date.today().strftime("%Y-%m-%d")
-        user_prompt = (
-            f"当前日期：{today}\n\n用户输入：{message}\n\n"
-            "请先判断用户意图（intent），再进行后续处理。"
+        super().__init__(
+            name=name,
+            system_prompt=NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT,
+            model=create_chat_model(),
         )
 
-        system_prompt = NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT
-        messages: list[Msg] = [SystemMsg(name="system", content=system_prompt)]
-        for hist_msg in conversation_history[-200:]:
-            role = hist_msg.get("role", "user")
-            content = hist_msg.get("content", "")
-            if role == "assistant":
-                messages.append(AssistantMsg(name="assistant", content=content))
-            else:
-                messages.append(UserMsg(name="user", content=content))
-        messages.append(UserMsg(name="user", content=user_prompt))
+    async def _reasoning_impl(self, tool_choice=None):
+        yield ModelCallStartEvent(
+            reply_id=self.state.reply_id,
+            model_name=self.model.model,
+        )
 
-        msg_id = str(uuid.uuid4())
-        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
+        kwargs = await self._prepare_model_input()
+        today = date.today().strftime("%Y-%m-%d")
 
         try:
-            response = await self.model(messages)
-            result_msg = AssistantMsg(name=self.name, content=list(response.content), id=msg_id)
+            response = await self._call_model(messages=kwargs["messages"], tools=[])
+            result_msg = AssistantMsg(name=self.name, content=list(response.content))
             raw = result_msg.get_text_content() or ""
             logger.info("IntentAgent raw response: %s", raw[:300])
             parse_result = self._parse_response(raw, today)
@@ -85,18 +62,20 @@ class IntentAgent:
             }
 
         text = json.dumps(parse_result, ensure_ascii=False, default=str)
-        result_msg = AssistantMsg(
+
+        yield ModelCallEndEvent(reply_id=self.state.reply_id, input_tokens=0, output_tokens=0)
+
+        block_id = __import__("uuid").uuid4().hex
+        yield TextBlockStartEvent(reply_id=self.state.reply_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=self.state.reply_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=self.state.reply_id, block_id=block_id)
+
+        yield AssistantMsg(
+            id=self.state.reply_id,
             name=self.name,
             content=text,
-            id=msg_id,
             metadata={"parse_result": parse_result},
         )
-
-        block_id = str(uuid.uuid4())
-        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
-        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
-        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
-        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
 
     def _parse_response(self, raw: str, today: str) -> dict | None:
         """Parse LLM response JSON into a structured result."""

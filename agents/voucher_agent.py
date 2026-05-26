@@ -2,63 +2,82 @@
 
 import json
 import logging
-import uuid
-from collections.abc import AsyncGenerator
+from dataclasses import asdict
+from decimal import Decimal
 
+from agentscope.agent import Agent
 from agentscope.event import (
-    EventBase,
-    ReplyStartEvent,
-    ReplyEndEvent,
+    ModelCallStartEvent,
+    ModelCallEndEvent,
     TextBlockStartEvent,
     TextBlockDeltaEvent,
     TextBlockEndEvent,
 )
-from agentscope.message import Msg, AssistantMsg
+from agentscope.message import Msg, UserMsg, AssistantMsg
 
-from llm_voucher_generator import LLMVoucherGenerator
+from llm_voucher_generator import _parse_llm_response, _extract_json
+from prompts import VOUCHER_GENERATION_PROMPT
 from voucher_models import SalesTransaction
+from voucher_rules import build_sales_revenue_voucher
+
+from .model_factory import create_chat_model
 
 logger = logging.getLogger(__name__)
 
 
-class VoucherAgent:
+class VoucherAgent(Agent):
     """Generate accounting voucher drafts from SalesTransaction data."""
 
     def __init__(self, name: str) -> None:
-        self.name = name
-        self._generator = LLMVoucherGenerator()
+        super().__init__(
+            name=name,
+            system_prompt=VOUCHER_GENERATION_PROMPT,
+            model=create_chat_model(),
+        )
 
     async def reply(self, msg: Msg) -> Msg:
-        final = None
-        async for event in self.reply_stream(msg, session_id=""):
-            if isinstance(event, ReplyStartEvent):
-                final = AssistantMsg(name=self.name, content=[], id=event.reply_id)
-            if final is not None:
-                final.append_event(event)
-        return final  # type: ignore[return-value]
+        txn = self._extract_transaction(msg)
+        user_prompt = _build_user_prompt(txn)
+        await self.observe(UserMsg(name="user", content=user_prompt))
+        return await super().reply(msg)
 
-    async def reply_stream(self, msg: Msg, session_id: str = "") -> AsyncGenerator[EventBase, None]:
-        msg_id = str(uuid.uuid4())
-        yield ReplyStartEvent(reply_id=msg_id, session_id=session_id, name=self.name)
+    async def _reasoning_impl(self, tool_choice=None):
+        yield ModelCallStartEvent(
+            reply_id=self.state.reply_id,
+            model_name=self.model.model,
+        )
+
+        kwargs = await self._prepare_model_input()
+        txn = self._extract_transaction_from_context()
 
         try:
-            txn = self._extract_transaction(msg)
-            voucher = await self._generator.generate(txn)
+            response = await self._call_model(messages=kwargs["messages"], tools=[])
+            result_msg = AssistantMsg(name=self.name, content=list(response.content))
+            raw = result_msg.get_text_content() or ""
+            voucher = _parse_llm_response(raw, txn)
             voucher_dict = _voucher_to_dict(voucher)
             text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
             metadata = {"status": "generated", "voucher": voucher}
         except Exception as exc:
-            logger.error("VoucherAgent generation failed: %s", exc)
-            text = "{}"
-            metadata = {"status": "error", "error": str(exc)}
+            logger.warning("LLM voucher generation failed (%s: %s), falling back to rule engine.", type(exc).__name__, exc)
+            voucher = build_sales_revenue_voucher(txn)
+            voucher_dict = _voucher_to_dict(voucher)
+            text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
+            metadata = {"status": "generated", "voucher": voucher}
 
-        result_msg = AssistantMsg(name=self.name, content=text, id=msg_id, metadata=metadata)
+        yield ModelCallEndEvent(reply_id=self.state.reply_id, input_tokens=0, output_tokens=0)
 
-        block_id = str(uuid.uuid4())
-        yield TextBlockStartEvent(reply_id=msg_id, block_id=block_id)
-        yield TextBlockDeltaEvent(reply_id=msg_id, block_id=block_id, delta=text)
-        yield TextBlockEndEvent(reply_id=msg_id, block_id=block_id)
-        yield ReplyEndEvent(reply_id=msg_id, session_id=session_id)
+        block_id = __import__("uuid").uuid4().hex
+        yield TextBlockStartEvent(reply_id=self.state.reply_id, block_id=block_id)
+        yield TextBlockDeltaEvent(reply_id=self.state.reply_id, block_id=block_id, delta=text)
+        yield TextBlockEndEvent(reply_id=self.state.reply_id, block_id=block_id)
+
+        yield AssistantMsg(
+            id=self.state.reply_id,
+            name=self.name,
+            content=text,
+            metadata=metadata,
+        )
 
     def _extract_transaction(self, msg: Msg) -> SalesTransaction:
         """Extract SalesTransaction from message content or metadata."""
@@ -66,25 +85,47 @@ class VoucherAgent:
             return msg.metadata["transaction"]
 
         data = json.loads(msg.get_text_content() or "{}")
-        from decimal import Decimal
-        return SalesTransaction(
-            transaction_id=data["transaction_id"],
-            company_code=data.get("company_code", "1000"),
-            document_date=data.get("document_date", ""),
-            posting_date=data.get("posting_date", ""),
-            customer_code=data.get("customer_code", "C99999"),
-            customer_name=data.get("customer_name", "未知客户"),
-            product_type=data.get("product_type", "service"),
-            contract_no=data.get("contract_no", ""),
-            invoice_no=data.get("invoice_no", ""),
-            currency=data.get("currency", "CNY"),
-            tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
-            tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-            tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-            total_amount=Decimal(str(data["total_amount"])),
-            profit_center=data.get("profit_center", "PC-DEFAULT"),
-            cost_center=data.get("cost_center", "CC-DEFAULT"),
-        )
+        return _dict_to_transaction(data)
+
+    def _extract_transaction_from_context(self) -> SalesTransaction:
+        """Extract SalesTransaction from the last user message in context."""
+        for msg in reversed(self.state.context):
+            if msg.role == "user" and msg.metadata and "transaction" in msg.metadata:
+                return msg.metadata["transaction"]
+        raise ValueError("No transaction found in agent context")
+
+
+def _build_user_prompt(txn: SalesTransaction) -> str:
+    txn_dict = asdict(txn)
+    for key, value in txn_dict.items():
+        if isinstance(value, Decimal):
+            txn_dict[key] = str(value)
+
+    return (
+        "请根据以下销售业务数据生成会计凭证草稿：\n\n"
+        f"```json\n{json.dumps(txn_dict, ensure_ascii=False, indent=2)}\n```"
+    )
+
+
+def _dict_to_transaction(data: dict) -> SalesTransaction:
+    return SalesTransaction(
+        transaction_id=data["transaction_id"],
+        company_code=data.get("company_code", "1000"),
+        document_date=data.get("document_date", ""),
+        posting_date=data.get("posting_date", ""),
+        customer_code=data.get("customer_code", "C99999"),
+        customer_name=data.get("customer_name", "未知客户"),
+        product_type=data.get("product_type", "service"),
+        contract_no=data.get("contract_no", ""),
+        invoice_no=data.get("invoice_no", ""),
+        currency=data.get("currency", "CNY"),
+        tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
+        tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
+        tax_amount=Decimal(str(data.get("tax_amount", "0"))),
+        total_amount=Decimal(str(data["total_amount"])),
+        profit_center=data.get("profit_center", "PC-DEFAULT"),
+        cost_center=data.get("cost_center", "CC-DEFAULT"),
+    )
 
 
 def _voucher_to_dict(voucher) -> dict:
