@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
 
-from agentscope.credential import OpenAICredential
-from agentscope.model import OpenAIChatModel
+from agentscope.credential import DeepSeekCredential
+from agentscope.model import DeepSeekChatModel
 
 PMDE_BASE_URL = os.environ.get("PMDE_BASE_URL", "")
 PMDE_API_KEY = os.environ.get("PMDE_API_KEY", "")
@@ -18,11 +18,11 @@ PMDE_MODEL_NAME = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
 PMDE_VISION_MODEL_NAME = os.environ.get("PMDE_VISION_MODEL_NAME", "deepseek-v4-pro")
 
 
-def create_chat_model(vision: bool = False) -> OpenAIChatModel:
-    """Create an OpenAIChatModel for the configured DeepSeek endpoint."""
-    return OpenAIChatModel(
-        credential=OpenAICredential(api_key=PMDE_API_KEY, base_url=PMDE_BASE_URL),
+def create_chat_model(vision: bool = False) -> DeepSeekChatModel:
+    """Create a DeepSeekChatModel for the configured endpoint."""
+    return DeepSeekChatModel(
+        credential=DeepSeekCredential(api_key=PMDE_API_KEY, base_url=PMDE_BASE_URL),
         model=PMDE_VISION_MODEL_NAME if vision else PMDE_MODEL_NAME,
         stream=False,
-        parameters=OpenAIChatModel.Parameters(temperature=0.1),
+        parameters=DeepSeekChatModel.Parameters(temperature=0.1),
     )

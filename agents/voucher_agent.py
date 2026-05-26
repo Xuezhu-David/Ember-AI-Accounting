@@ -15,9 +15,8 @@ from agentscope.event import (
 )
 from agentscope.message import Msg, UserMsg, AssistantMsg
 
-from llm_voucher_generator import _parse_llm_response, _extract_json
 from prompts import VOUCHER_GENERATION_PROMPT
-from voucher_models import SalesTransaction
+from voucher_models import SalesTransaction, Voucher, VoucherLine
 from voucher_rules import build_sales_revenue_voucher
 
 from .model_factory import create_chat_model
@@ -126,6 +125,70 @@ def _dict_to_transaction(data: dict) -> SalesTransaction:
         profit_center=data.get("profit_center", "PC-DEFAULT"),
         cost_center=data.get("cost_center", "CC-DEFAULT"),
     )
+
+
+def _parse_llm_response(raw: str, txn: SalesTransaction) -> Voucher:
+    """Parse LLM JSON response into a Voucher object."""
+    json_str = _extract_json(raw)
+    data = json.loads(json_str)
+
+    lines = [
+        VoucherLine(
+            line_no=line_data["line_no"],
+            debit_credit=line_data["debit_credit"],
+            account_code=line_data["account_code"],
+            account_name=line_data["account_name"],
+            amount=Decimal(str(line_data["amount"])),
+            currency=txn.currency,
+            customer_code=line_data.get("customer_code", ""),
+            customer_name=line_data.get("customer_name", ""),
+            tax_code=line_data.get("tax_code", ""),
+            profit_center=line_data.get("profit_center", ""),
+            cost_center=line_data.get("cost_center", ""),
+            assignment=line_data.get("assignment", ""),
+            text=line_data.get("text", ""),
+        )
+        for line_data in data.get("lines", [])
+    ]
+
+    warnings: list[str] = list(data.get("warnings", []))
+
+    debit_total = sum(line.amount for line in lines if line.debit_credit == "S")
+    credit_total = sum(line.amount for line in lines if line.debit_credit == "H")
+    if abs(debit_total - credit_total) > Decimal("0.01"):
+        warnings.append(f"Voucher not balanced: debit={debit_total}, credit={credit_total}")
+
+    calculated_total = txn.tax_excluded_amount + txn.tax_amount
+    if abs(calculated_total - txn.total_amount) > Decimal("0.01"):
+        warnings.append("Total amount does not equal tax excluded amount plus tax amount.")
+
+    confidence = Decimal(str(data.get("confidence", 0.70)))
+    if warnings and confidence > Decimal("0.70"):
+        confidence = Decimal("0.70")
+
+    return Voucher(
+        voucher_id=f"VR-{txn.transaction_id}",
+        company_code=txn.company_code,
+        document_type="DR",
+        document_date=txn.document_date,
+        posting_date=txn.posting_date,
+        reference=txn.invoice_no,
+        header_text=data.get("header_text", ""),
+        source_transaction_id=txn.transaction_id,
+        confidence=confidence,
+        warnings=warnings,
+        lines=lines,
+    )
+
+
+def _extract_json(text: str) -> str:
+    """Extract JSON from a possibly markdown-wrapped LLM response."""
+    text = text.strip()
+    if "```json" in text:
+        return text.split("```json")[1].split("```")[0].strip()
+    if "```" in text:
+        return text.split("```")[1].split("```")[0].strip()
+    return text
 
 
 def _voucher_to_dict(voucher) -> dict:
