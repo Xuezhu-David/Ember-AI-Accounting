@@ -29,7 +29,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from prompts import NL_PARSE_SYSTEM_PROMPT, IMAGE_PARSE_SYSTEM_PROMPT
+import agentscope
+from agentscope.message import Msg
+from agents.intent_agent import IntentAgent
+from agents.voucher_agent import VoucherAgent
+from agents.ocr_agent import OcrAgent
 
 from database import (
     add_audit_log,
@@ -58,7 +62,6 @@ from database import (
     count_voucher_records,
 )
 from excel_loader import load_sales_transactions
-from llm_voucher_generator import LLMVoucherGenerator
 from sap_exporter import export_sap_csv
 from voucher_models import Voucher, VoucherLine
 from voucher_rules import build_sales_revenue_voucher, load_voucher_rule_lines, VoucherRuleLine
@@ -101,8 +104,6 @@ BIZ_TYPE_LABELS = {
 POSTED_CSV.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Globals ──────────────────────────────────────────────────────────────────
-
-generator = LLMVoucherGenerator()
 
 SUPPORTED_BUSINESS_TYPES = {
     "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
@@ -290,6 +291,13 @@ async def startup():
     migrated = await migrate_rules_from_excel()
     if migrated:
         logger.info("Migrated %d rules from Excel to database", migrated)
+
+    # Initialize AgentScope agents
+    agentscope.init(project="EmberAI", name="accounting_server")
+    app.state.intent_agent = IntentAgent("intent_agent")
+    app.state.voucher_agent = VoucherAgent("voucher_agent")
+    app.state.ocr_agent = OcrAgent("ocr_agent")
+    logger.info("AgentScope agents initialized")
 
 
 # ── API: Auth ─────────────────────────────────────────────────────────────────
@@ -558,7 +566,9 @@ async def chat(payload: dict, request: Request):
                     logger.info("Pending action: continuing %s (type=%s) for '%s'", pending, detected_type, message[:60])
 
     if parse_result is None:
-        parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
+        intent_msg = Msg(name="user", role="user", content=message, metadata={"history": history_for_llm})
+        intent_result_msg = await app.state.intent_agent.reply(intent_msg)
+        parse_result = intent_result_msg.metadata.get("parse_result") if intent_result_msg.metadata else None
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
@@ -981,7 +991,11 @@ async def chat(payload: dict, request: Request):
             "session_id": session_id,
         })
 
-    voucher = await generator.generate(txn)
+    voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+    voucher_result = await app.state.voucher_agent.reply(voucher_msg)
+    voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
+    if not voucher:
+        return JSONResponse({"reply": "凭证生成失败，请重试。", "session_id": session_id})
     session["vouchers"].append(voucher)
     _save_session(session_id, session)
 
@@ -1073,10 +1087,10 @@ async def upload_file(
 
     # ── Image / PDF path: use multimodal LLM for OCR ──
     if suffix in IMAGE_EXTENSIONS or suffix in PDF_EXTENSIONS:
-        if suffix in PDF_EXTENSIONS:
-            result = await _parse_pdf_to_transaction(saved_path)
-        else:
-            result = await _parse_image_to_transaction(saved_path)
+        file_type = "pdf" if suffix in PDF_EXTENSIONS else "image"
+        ocr_msg = Msg(name="user", role="user", content="", metadata={"file_path": str(saved_path), "file_type": file_type})
+        ocr_result_msg = await app.state.ocr_agent.reply(ocr_msg)
+        result = ocr_result_msg.metadata.get("ocr_result") if ocr_result_msg.metadata else None
 
         source_label = "PDF" if suffix in PDF_EXTENSIONS else "图片"
 
@@ -1109,7 +1123,13 @@ async def upload_file(
                 "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             })
 
-        voucher = await generator.generate(txn)
+        voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_result = await app.state.voucher_agent.reply(voucher_msg)
+        voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
+        if not voucher:
+            reply = "凭证生成失败，请重试。"
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload")
+            return JSONResponse({"reply": reply, "session_id": session_id})
         session["vouchers"].append(voucher)
         _save_session(session_id, session)
 
@@ -1163,7 +1183,11 @@ async def upload_file(
 
     vouchers = []
     for txn in transactions:
-        voucher = await generator.generate(txn)
+        voucher_msg = Msg(name="user", role="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_result = await app.state.voucher_agent.reply(voucher_msg)
+        voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
+        if not voucher:
+            continue
         session["vouchers"].append(voucher)
         vouchers.append(voucher)
 
@@ -1556,339 +1580,6 @@ async def api_chat_history(request: Request, limit: int = 100, offset: int = 0):
         "limit": limit,
         "offset": offset,
     })
-
-
-# ── NL → Transaction via LLM ─────────────────────────────────────────────────
-
-
-async def _parse_transaction_from_nl(message: str, history: list[dict] | None = None) -> dict | None:
-    from openai import AsyncOpenAI
-    import os
-
-    base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
-    )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
-    model_name = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
-
-    today = date.today().strftime("%Y-%m-%d")
-    user_prompt = (
-        f"当前日期：{today}\n\n用户输入：{message}\n\n"
-        "请先判断用户意图（intent），再进行后续处理。"
-    )
-
-    # Build message list with conversation history for context
-    messages = [{"role": "system", "content": NL_PARSE_SYSTEM_PROMPT}]
-    if history:
-        for msg in history[-200:]:  # Last 100 turns (user + assistant pairs)
-            messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": user_prompt})
-
-    try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-        completion = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=0.1,
-        )
-        raw = completion.choices[0].message.content
-
-        json_str = raw.strip()
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0].strip()
-
-        data = json.loads(json_str)
-        intent = data.get("intent", "unknown")
-
-        if intent == "chat":
-            return {
-                "intent": "chat",
-                "reply": data.get("reply", "你好！我是 Ember，有什么可以帮你的吗？"),
-                "business_type": None,
-                "transaction": None,
-            }
-
-        if intent == "rule_query":
-            return {
-                "intent": "rule_query",
-                "rule_type": data.get("rule_type"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
-
-        if intent == "rule_mgmt":
-            return {
-                "intent": "rule_mgmt",
-                "action": data.get("action", "create"),
-                "rule_type": data.get("rule_type"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
-
-        if intent == "voucher_query":
-            return {
-                "intent": "voucher_query",
-                "status": data.get("status"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
-
-        if intent == "user_mgmt":
-            return {
-                "intent": "user_mgmt",
-                "action": data.get("action", "create"),
-                "new_username": data.get("new_username"),
-                "new_display_name": data.get("new_display_name"),
-                "new_role": data.get("new_role", "user"),
-                "new_password": data.get("new_password"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
-
-        business_type = data.get("business_type", "other")
-
-        if business_type != "sales_revenue":
-            return {"intent": "business", "business_type": business_type, "transaction": None}
-
-        if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
-            return {"intent": "business", "business_type": business_type, "transaction": None}
-
-        from voucher_models import SalesTransaction
-
-        txn = SalesTransaction(
-            transaction_id=data["transaction_id"],
-            company_code=data.get("company_code", "1000"),
-            document_date=data.get("document_date", today),
-            posting_date=data.get("posting_date", today),
-            customer_code=data.get("customer_code", "C99999"),
-            customer_name=data.get("customer_name", "未知客户"),
-            product_type=data.get("product_type", "service"),
-            contract_no=data.get("contract_no", ""),
-            invoice_no=data.get("invoice_no", ""),
-            currency=data.get("currency", "CNY"),
-            tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
-            tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-            tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-            total_amount=Decimal(str(data["total_amount"])),
-            profit_center=data.get("profit_center", "PC-DEFAULT"),
-            cost_center=data.get("cost_center", "CC-DEFAULT"),
-        )
-        return {"intent": "business", "business_type": business_type, "transaction": txn}
-
-    except Exception as exc:
-        logger.error("NL parse failed: %s", exc)
-        return None
-
-
-async def _parse_image_to_transaction(image_path: Path) -> dict | None:
-    from openai import AsyncOpenAI
-    import os
-    import base64
-
-    base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
-    )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
-    model_name = os.environ.get(
-        "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
-    )
-
-    today = date.today().strftime("%Y-%m-%d")
-
-    try:
-        image_bytes = image_path.read_bytes()
-        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-        ext = image_path.suffix.lower()
-        mime_map = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-        }
-        mime_type = mime_map.get(ext, "image/jpeg")
-    except Exception as exc:
-        logger.error("Failed to read image: %s", exc)
-        return None
-
-    try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-        completion = await client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": IMAGE_PARSE_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
-                        {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"},
-                    ],
-                },
-            ],
-            temperature=0.1,
-        )
-        raw = completion.choices[0].message.content
-
-        json_str = raw.strip()
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0].strip()
-
-        data = json.loads(json_str)
-        business_type = data.get("business_type", "other")
-
-        if business_type != "sales_revenue":
-            return {"business_type": business_type, "transaction": None}
-
-        if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
-            return {"business_type": business_type, "transaction": None}
-
-        from voucher_models import SalesTransaction
-
-        txn = SalesTransaction(
-            transaction_id=data["transaction_id"],
-            company_code=data.get("company_code", "1000"),
-            document_date=data.get("document_date", today),
-            posting_date=data.get("posting_date", today),
-            customer_code=data.get("customer_code", "C99999"),
-            customer_name=data.get("customer_name", "未知客户"),
-            product_type=data.get("product_type", "service"),
-            contract_no=data.get("contract_no", ""),
-            invoice_no=data.get("invoice_no", ""),
-            currency=data.get("currency", "CNY"),
-            tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
-            tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-            tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-            total_amount=Decimal(str(data["total_amount"])),
-            profit_center=data.get("profit_center", "PC-DEFAULT"),
-            cost_center=data.get("cost_center", "CC-DEFAULT"),
-        )
-        return {"business_type": business_type, "transaction": txn}
-
-    except Exception as exc:
-        logger.error("Image parse failed: %s", exc)
-        return None
-
-
-def _pdf_to_images(pdf_path: Path) -> list[tuple[bytes, str]]:
-    import fitz
-
-    doc = fitz.open(str(pdf_path))
-    pages = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=200)
-        pages.append((pix.tobytes("png"), "image/png"))
-    doc.close()
-    return pages
-
-
-async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
-    from openai import AsyncOpenAI
-    import os
-    import base64
-
-    try:
-        pages = _pdf_to_images(pdf_path)
-    except Exception as exc:
-        logger.error("Failed to convert PDF to images: %s", exc)
-        return None
-
-    if not pages:
-        return None
-
-    base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
-    )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
-    model_name = os.environ.get(
-        "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
-    )
-
-    today = date.today().strftime("%Y-%m-%d")
-
-    image_blocks = []
-    for i, (img_bytes, mime_type) in enumerate(pages):
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        image_blocks.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-        })
-
-    page_note = ""
-    if len(pages) > 1:
-        page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
-
-    try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-        completion = await client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": IMAGE_PARSE_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        *image_blocks,
-                        {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"},
-                    ],
-                },
-            ],
-            temperature=0.1,
-        )
-        raw = completion.choices[0].message.content
-
-        json_str = raw.strip()
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0].strip()
-
-        data = json.loads(json_str)
-        business_type = data.get("business_type", "other")
-
-        if business_type != "sales_revenue":
-            return {"business_type": business_type, "transaction": None}
-
-        if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
-            return {"business_type": business_type, "transaction": None}
-
-        from voucher_models import SalesTransaction
-
-        txn = SalesTransaction(
-            transaction_id=data["transaction_id"],
-            company_code=data.get("company_code", "1000"),
-            document_date=data.get("document_date", today),
-            posting_date=data.get("posting_date", today),
-            customer_code=data.get("customer_code", "C99999"),
-            customer_name=data.get("customer_name", "未知客户"),
-            product_type=data.get("product_type", "service"),
-            contract_no=data.get("contract_no", ""),
-            invoice_no=data.get("invoice_no", ""),
-            currency=data.get("currency", "CNY"),
-            tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
-            tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-            tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-            total_amount=Decimal(str(data["total_amount"])),
-            profit_center=data.get("profit_center", "PC-DEFAULT"),
-            cost_center=data.get("cost_center", "CC-DEFAULT"),
-        )
-        return {"business_type": business_type, "transaction": txn}
-
-    except Exception as exc:
-        logger.error("PDF parse failed: %s", exc)
-        return None
 
 
 # ── Serve static frontend ────────────────────────────────────────────────────
