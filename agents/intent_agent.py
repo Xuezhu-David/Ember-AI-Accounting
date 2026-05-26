@@ -5,7 +5,7 @@ import logging
 from datetime import date
 from decimal import Decimal
 
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ContextConfig
 from agentscope.event import (
     ModelCallStartEvent,
     ModelCallEndEvent,
@@ -14,6 +14,7 @@ from agentscope.event import (
     TextBlockEndEvent,
 )
 from agentscope.message import Msg, AssistantMsg
+from agentscope.middleware import MiddlewareBase
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
@@ -24,6 +25,14 @@ from .model_factory import create_chat_model
 logger = logging.getLogger(__name__)
 
 
+class _SystemPromptMiddleware(MiddlewareBase):
+    """Inject dynamic context (e.g. current date) into the system prompt."""
+
+    async def on_system_prompt(self, agent: Agent, current_prompt: str) -> str:
+        today = date.today().strftime("%Y-%m-%d")
+        return f"{current_prompt}\n\n## 当前日期\n{today}"
+
+
 class IntentAgent(Agent):
     """Classify user intent and extract business data from natural language."""
 
@@ -32,7 +41,16 @@ class IntentAgent(Agent):
             name=name,
             system_prompt=NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT,
             model=create_chat_model(),
+            middlewares=[_SystemPromptMiddleware()],
+            context_config=ContextConfig(
+                trigger_ratio=0.8,
+                reserve_ratio=0.1,
+            ),
         )
+
+    async def reply(self, msg: Msg) -> Msg:
+        self.state.context.clear()
+        return await super().reply(msg)
 
     async def _reasoning_impl(self, tool_choice=None):
         yield ModelCallStartEvent(
