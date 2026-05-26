@@ -1,18 +1,19 @@
 """Centralized model creation for all AgentScope agents."""
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path)
 
 from agentscope.formatter import OpenAIChatFormatter
 from agentscope.model import OpenAIChatModel
 
-PMDE_BASE_URL = os.environ.get(
-    "PMDE_BASE_URL",
-    "https://ark.cn-beijing.volces.com/api/coding/v3",
-)
-PMDE_API_KEY = os.environ.get(
-    "PMDE_API_KEY",
-    "4fea2171-9079-434e-bdf5-d98a00db9363",
-)
+PMDE_BASE_URL = os.environ.get("PMDE_BASE_URL", "")
+PMDE_API_KEY = os.environ.get("PMDE_API_KEY", "")
 PMDE_MODEL_NAME = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
 PMDE_VISION_MODEL_NAME = os.environ.get("PMDE_VISION_MODEL_NAME", "deepseek-v4-pro")
 
