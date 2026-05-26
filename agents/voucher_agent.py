@@ -2,7 +2,6 @@
 
 import json
 import logging
-from dataclasses import asdict
 
 from agentscope.message import Msg
 

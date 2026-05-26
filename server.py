@@ -13,20 +13,18 @@ Run:
     python server.py
 """
 
-import asyncio
 import json
 import logging
 import shutil
 import uuid
 from dataclasses import asdict
-from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from agentscope.message import Msg
@@ -64,7 +62,6 @@ from database import (
 from excel_loader import load_sales_transactions
 from sap_exporter import export_sap_csv
 from voucher_models import Voucher, VoucherLine
-from voucher_rules import build_sales_revenue_voucher, load_voucher_rule_lines, VoucherRuleLine
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -900,7 +897,7 @@ async def chat(payload: dict, request: Request):
 
             # Generate default password if not provided
             if not new_password:
-                import string
+                import secrets
                 new_password = "User@" + secrets.token_hex(4)
 
             try:
