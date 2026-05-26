@@ -11,6 +11,7 @@ from agentscope.message import Msg
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
 
+from .agent_config import IDENTITY_CONTEXT, AGENT_NAME, AGENT_CAPABILITIES
 from .model_factory import create_chat_model, create_formatter
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,8 @@ class IntentAgent(AgentBase):
         )
 
         # Build messages for the LLM
-        messages = [{"role": "system", "content": NL_PARSE_SYSTEM_PROMPT}]
+        system_prompt = NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT
+        messages = [{"role": "system", "content": system_prompt}]
         for hist_msg in conversation_history[-200:]:
             messages.append({"role": hist_msg["role"], "content": hist_msg["content"]})
         messages.append({"role": "user", "content": user_prompt})
@@ -67,7 +69,7 @@ class IntentAgent(AgentBase):
         if parse_result is None:
             parse_result = {
                 "intent": "chat",
-                "reply": "你好！我是 Ember，你的智能记账助手。我可以帮你生成会计凭证、管理凭证规则、查询凭证记录等。有什么可以帮你的吗？",
+                "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？",
                 "business_type": None,
                 "transaction": None,
             }

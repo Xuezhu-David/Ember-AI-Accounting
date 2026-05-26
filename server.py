@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 import agentscope
 from agentscope.message import Msg
+from agents.agent_config import AGENT_NAME, AGENT_CAPABILITIES
 from agents.intent_agent import IntentAgent
 from agents.voucher_agent import VoucherAgent
 from agents.ocr_agent import OcrAgent
@@ -572,7 +573,7 @@ async def chat(payload: dict, request: Request):
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
-            "reply": "你好！我是 Ember，你的智能记账助手。我可以帮你生成会计凭证、管理凭证规则、查询凭证记录等。有什么可以帮你的吗？",
+            "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？",
             "session_id": session_id,
         })
 
