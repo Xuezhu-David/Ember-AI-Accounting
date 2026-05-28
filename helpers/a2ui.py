@@ -73,12 +73,17 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
 
     status = voucher_front.get("status", "draft")
     is_posted = status == "posted"
+    is_reversed = status == "reversed"
+
+    # Status badge
+    status_map = {"posted": "已过账", "reversed": "已冲销"}
+    status_badge = status_map.get(status, "草稿")
 
     components = [
         {"id": "back-btn", "component": "Button", "child": "back-text",
          "variant": "secondary", "action": {"event": {"name": "back_to_voucher_list"}}},
         {"id": "back-text", "component": "Text", "text": "← 返回列表"},
-        {"id": "title", "component": "Text", "text": f"凭证 {voucher_id}", "variant": "h2"},
+        {"id": "title", "component": "Text", "text": f"凭证 {voucher_id}  [{status_badge}]", "variant": "h2"},
         {"id": "info-card", "component": "Card", "title": "凭证信息", "children": ["kv-info"]},
         {"id": "kv-info", "component": "KeyValue", "pairs": header_pairs},
         *warning_components,
@@ -129,30 +134,40 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
 
     if show_actions:
         components.extend([
-            {"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn"]},
+            {"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn", "reverse-btn", "pdf-btn"]},
             {"id": "confirm-btn", "component": "Button", "child": "confirm-text",
-             "variant": "primary", "disabled": is_posted,
+             "variant": "primary", "disabled": is_posted or is_reversed,
              "action": {"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else "确认并记账"},
+            {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else ("已冲销" if is_reversed else "确认并记账")},
             {"id": "edit-btn", "component": "Button", "child": "edit-text",
-             "variant": "secondary", "disabled": is_posted,
+             "variant": "secondary", "disabled": is_posted or is_reversed,
              "action": {"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}}},
             {"id": "edit-text", "component": "Text", "text": "编辑凭证"},
+            {"id": "reverse-btn", "component": "Button", "child": "reverse-text",
+             "variant": "danger", "disabled": not is_posted,
+             "action": {"event": {"name": "reverse_voucher", "data": {"voucherId": voucher_id}}}},
+            {"id": "reverse-text", "component": "Text", "text": "冲销凭证"},
+            {"id": "pdf-btn", "component": "Button", "child": "pdf-text",
+             "variant": "secondary",
+             "action": {"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}},
+            {"id": "pdf-text", "component": "Text", "text": "导出 PDF"},
         ])
     return _build_a2ui_messages("voucher-detail", components)
 
 
-def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None) -> dict:
+def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None) -> dict:
     """Convert voucher records list to A2UI messages."""
-    status_label = {"draft": "草稿", "posted": "已过账"}.get(status_filter, "全部")
+    status_label = {"draft": "草稿", "posted": "已过账", "reversed": "已冲销"}.get(status_filter, "全部")
 
     tabs = [
         {"key": "", "label": "全部"},
         {"key": "draft", "label": "草稿"},
         {"key": "posted", "label": "已过账"},
+        {"key": "reversed", "label": "已冲销"},
     ]
 
     table_columns = [
+        {"key": "select", "label": "☐", "width": "36px"},
         {"key": "voucher_id", "label": "凭证号"},
         {"key": "document_type", "label": "类型"},
         {"key": "document_date", "label": "日期"},
@@ -162,8 +177,10 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None) 
     ]
     table_rows = []
     for rec in records:
-        status_text = "已过账" if rec.get("status") == "posted" else "草稿"
+        st = rec.get("status", "draft")
+        status_text = {"posted": "已过账", "reversed": "已冲销"}.get(st, "草稿")
         table_rows.append({
+            "select": "☐",
             "voucher_id": rec.get("voucher_id", ""),
             "document_type": rec.get("document_type", ""),
             "document_date": rec.get("document_date", ""),
@@ -174,11 +191,21 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None) 
 
     components = [
         {"id": "title", "component": "Text", "text": f"凭证列表 — {status_label}（共 {total} 条）", "variant": "h2"},
+        {"id": "search-row", "component": "Row", "children": ["search-input", "search-btn", "batch-post-btn"]},
+        {"id": "search-input", "component": "SearchInput", "placeholder": "搜索凭证（摘要、凭证号、客户）",
+         "value": keyword or "", "action": {"event": {"name": "search_vouchers"}}},
+        {"id": "search-btn", "component": "Button", "child": "search-btn-text",
+         "variant": "secondary", "action": {"event": {"name": "search_vouchers"}}},
+        {"id": "search-btn-text", "component": "Text", "text": "搜索"},
+        {"id": "batch-post-btn", "component": "Button", "child": "batch-post-text",
+         "variant": "primary", "disabled": True,
+         "action": {"event": {"name": "batch_post_vouchers"}}},
+        {"id": "batch-post-text", "component": "Text", "text": "批量过账"},
         {"id": "filter-tabs", "component": "FilterTabs",
          "tabs": tabs, "active": status_filter or "",
          "action": {"event": {"name": "filter_vouchers"}}},
         {"id": "voucher-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows,
+         "columns": table_columns, "rows": table_rows, "selectable": True,
          "rowAction": {"event": {"name": "view_voucher_detail", "data": {"voucherId": "{voucher_id}"}}}},
     ]
     return _build_a2ui_messages("voucher-list", components)

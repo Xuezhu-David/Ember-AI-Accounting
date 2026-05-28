@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page { size: A4; margin: 20mm 15mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif; font-size: 11pt; color: #1a1a1a; }
+  .header { text-align: center; border-bottom: 2px solid #1a1a1a; padding-bottom: 12px; margin-bottom: 16px; }
+  .header h1 { font-size: 20pt; letter-spacing: 4px; margin-bottom: 4px; }
+  .header .subtitle { font-size: 9pt; color: #666; }
+  .meta-grid { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-bottom: 16px; font-size: 10pt; }
+  .meta-item { min-width: 140px; }
+  .meta-label { color: #888; font-size: 9pt; }
+  .meta-value { font-weight: 500; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 9pt; font-weight: 500; }
+  .badge-draft { background: #fef3c7; color: #92400e; }
+  .badge-posted { background: #d1fae5; color: #065f46; }
+  .badge-reversed { background: #fee2e2; color: #991b1b; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 9.5pt; }
+  thead th { background: #f3f4f6; border: 1px solid #d1d5db; padding: 6px 8px; text-align: left; font-weight: 600; white-space: nowrap; }
+  tbody td { border: 1px solid #d1d5db; padding: 5px 8px; vertical-align: top; }
+  tbody tr:nth-child(even) { background: #fafafa; }
+  .text-right { text-align: right; }
+  .text-center { text-align: center; }
+  tfoot td { border: 1px solid #d1d5db; padding: 6px 8px; font-weight: 600; background: #f9fafb; }
+  .footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 8pt; color: #999; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>会计凭证</h1>
+    <div class="subtitle">Ember AI 智能记账系统</div>
+  </div>
+
+  <div class="meta-grid">
+    <div class="meta-item">
+      <div class="meta-label">凭证号</div>
+      <div class="meta-value">{{ voucher_id }}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">公司代码</div>
+      <div class="meta-value">{{ company_code }}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">凭证类型</div>
+      <div class="meta-value">{{ document_type }}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">凭证日期</div>
+      <div class="meta-value">{{ document_date }}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">过账日期</div>
+      <div class="meta-value">{{ posting_date }}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">状态</div>
+      <div class="meta-value">
+        {% if status == 'posted' %}<span class="badge badge-posted">已过账</span>
+        {% elif status == 'reversed' %}<span class="badge badge-reversed">已冲销</span>
+        {% else %}<span class="badge badge-draft">草稿</span>{% endif %}
+      </div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-label">参考</div>
+      <div class="meta-value">{{ reference or '—' }}</div>
+    </div>
+    <div class="meta-item" style="min-width:300px;">
+      <div class="meta-label">凭证头文本</div>
+      <div class="meta-value">{{ header_text or '—' }}</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>行号</th>
+        <th>科目代码</th>
+        <th>科目名称</th>
+        <th>借/贷</th>
+        <th class="text-right">借方金额</th>
+        <th class="text-right">贷方金额</th>
+        <th>币种</th>
+        <th>客户名称</th>
+        <th>摘要</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td class="text-center">{{ row.get('line_no', loop.index) }}</td>
+        <td>{{ row.get('account_code', '') }}</td>
+        <td>{{ row.get('account_name', '') }}</td>
+        <td class="text-center">{{ row.get('dc', '') }}</td>
+        <td class="text-right">{{ '%.2f' % row.get('debit', 0) if row.get('debit', 0) else '' }}</td>
+        <td class="text-right">{{ '%.2f' % row.get('credit', 0) if row.get('credit', 0) else '' }}</td>
+        <td class="text-center">{{ row.get('currency', 'CNY') }}</td>
+        <td>{{ row.get('customer_name', '') }}</td>
+        <td>{{ row.get('text', '') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="4" class="text-right">合计</td>
+        <td class="text-right">{{ '%.2f' % total_debit }}</td>
+        <td class="text-right">{{ '%.2f' % total_credit }}</td>
+        <td colspan="3"></td>
+      </tr>
+    </tfoot>
+  </table>
+
+  <div class="footer">
+    <span>制单人: {{ user_display_name or '—' }}{% if posted_by_name %}  |  过账人: {{ posted_by_name }}{% endif %}</span>
+    <span>生成时间: {{ created_at[:19] if created_at else '—' }}</span>
+  </div>
+</body>
+</html>

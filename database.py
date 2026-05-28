@@ -12,9 +12,11 @@ import json
 import logging
 import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import bcrypt
 
 import aiosqlite
 
@@ -24,18 +26,31 @@ DB_PATH = Path(__file__).parent / "data" / "ember.db"
 
 # ── Password hashing ──────────────────────────────────────────────────────────
 
+SESSION_TIMEOUT_HOURS = 6
+
+
+def _is_bcrypt_hash(hashed: str) -> bool:
+    """Check if a hash string is in bcrypt format."""
+    return hashed.startswith("$2")
+
 
 def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
-    """Hash a password with a random salt using SHA-256."""
-    if salt is None:
-        salt = secrets.token_hex(16)
+    """Hash a password using bcrypt. Salt parameter is ignored (bcrypt generates its own)."""
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return hashed, ""
+
+
+def _hash_password_legacy(password: str, salt: str) -> tuple[str, str]:
+    """Legacy SHA-256 hash for verifying old passwords."""
     hashed = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
     return hashed, salt
 
 
 def verify_password(password: str, hashed: str, salt: str) -> bool:
-    """Verify a password against its hash and salt."""
-    computed, _ = _hash_password(password, salt)
+    """Verify a password against its hash. Supports both bcrypt and legacy SHA-256."""
+    if _is_bcrypt_hash(hashed):
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    computed, _ = _hash_password_legacy(password, salt)
     return secrets.compare_digest(computed, hashed)
 
 
@@ -50,6 +65,7 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user',  -- 'user' or 'admin'
     is_active INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -76,10 +92,13 @@ CREATE TABLE IF NOT EXISTS voucher_records (
     confidence TEXT,
     warnings TEXT,  -- JSON array
     voucher_data TEXT NOT NULL,  -- Full voucher JSON
-    status TEXT NOT NULL DEFAULT 'draft',  -- 'draft' or 'posted'
+    status TEXT NOT NULL DEFAULT 'draft',  -- 'draft', 'posted', or 'reversed'
     created_at TEXT NOT NULL,
     posted_at TEXT,
     posted_by TEXT,
+    reversed_at TEXT,
+    reversed_by TEXT,
+    reversal_reason TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
@@ -183,6 +202,26 @@ async def init_db() -> None:
         await db.executescript(SCHEMA)
         await db.commit()
 
+        # Migration: add must_change_password column if missing
+        cursor = await db.execute("PRAGMA table_info(users)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "must_change_password" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+            # Flag existing admin users to change password
+            await db.execute("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
+            await db.commit()
+            logger.info("Migration: added must_change_password column to users")
+
+        # Migration: add reversal columns to voucher_records if missing
+        cursor = await db.execute("PRAGMA table_info(voucher_records)")
+        vr_columns = {row[1] for row in await cursor.fetchall()}
+        if "reversed_at" not in vr_columns:
+            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_at TEXT")
+            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_by TEXT")
+            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversal_reason TEXT")
+            await db.commit()
+            logger.info("Migration: added reversal columns to voucher_records")
+
         # Create default admin user if no users exist
         cursor = await db.execute("SELECT COUNT(*) FROM users")
         row = await cursor.fetchone()
@@ -190,9 +229,9 @@ async def init_db() -> None:
             admin_id = str(uuid.uuid4())
             hashed, salt = _hash_password("admin123")
             await db.execute(
-                """INSERT INTO users (id, username, password_hash, password_salt, display_name, role, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (admin_id, "admin", hashed, salt, "系统管理员", "admin",
+                """INSERT INTO users (id, username, password_hash, password_salt, display_name, role, must_change_password, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (admin_id, "admin", hashed, salt, "系统管理员", "admin", 1,
                  datetime.now().isoformat()),
             )
             await db.commit()
@@ -209,7 +248,7 @@ async def authenticate_user(username: str, password: str) -> dict | None:
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, username, password_hash, password_salt, display_name, role, is_active FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, password_salt, display_name, role, is_active, must_change_password FROM users WHERE username = ?",
             (username,),
         )
         row = await cursor.fetchone()
@@ -219,11 +258,23 @@ async def authenticate_user(username: str, password: str) -> dict | None:
             return None
         if not verify_password(password, row["password_hash"], row["password_salt"]):
             return None
+
+        # Auto-upgrade legacy SHA-256 hash to bcrypt
+        if not _is_bcrypt_hash(row["password_hash"]):
+            new_hash, _ = _hash_password(password)
+            await db.execute(
+                "UPDATE users SET password_hash = ?, password_salt = '' WHERE id = ?",
+                (new_hash, row["id"]),
+            )
+            await db.commit()
+            logger.info("Auto-upgraded password hash to bcrypt for user %s", row["username"])
+
         return {
             "id": row["id"],
             "username": row["username"],
             "display_name": row["display_name"],
             "role": row["role"],
+            "must_change_password": bool(row["must_change_password"]),
         }
     finally:
         await db.close()
@@ -233,12 +284,13 @@ async def create_session_token(user_id: str) -> str:
     """Create a session token for a user. Returns the token string."""
     token = secrets.token_urlsafe(32)
     session_id = str(uuid.uuid4())
+    expires_at = (datetime.now() + timedelta(hours=SESSION_TIMEOUT_HOURS)).isoformat()
     db = await get_db()
     try:
         await db.execute(
-            """INSERT INTO sessions (id, user_id, token, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, user_id, token, datetime.now().isoformat()),
+            """INSERT INTO sessions (id, user_id, token, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, user_id, token, datetime.now().isoformat(), expires_at),
         )
         await db.commit()
         return token
@@ -252,11 +304,13 @@ async def get_user_by_token(token: str) -> dict | None:
         return None
     db = await get_db()
     try:
+        now = datetime.now().isoformat()
         cursor = await db.execute(
             """SELECT u.id, u.username, u.display_name, u.role
                FROM users u JOIN sessions s ON u.id = s.user_id
-               WHERE s.token = ? AND u.is_active = 1""",
-            (token,),
+               WHERE s.token = ? AND u.is_active = 1
+               AND (s.expires_at IS NULL OR s.expires_at > ?)""",
+            (token, now),
         )
         row = await cursor.fetchone()
         if row is None:
@@ -281,12 +335,45 @@ async def delete_session(token: str) -> None:
         await db.close()
 
 
+async def change_password(user_id: str, new_password: str) -> bool:
+    """Change a user's password and clear must_change_password flag."""
+    hashed, _ = _hash_password(new_password)
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE users SET password_hash = ?, password_salt = '', must_change_password = 0 WHERE id = ?",
+            (hashed, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def clean_expired_sessions() -> int:
+    """Delete all expired sessions. Returns number of deleted sessions."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        cursor = await db.execute(
+            "DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (now,),
+        )
+        await db.commit()
+        count = cursor.rowcount
+        if count:
+            logger.info("Cleaned %d expired sessions", count)
+        return count
+    finally:
+        await db.close()
+
+
 async def list_users() -> list[dict]:
     """List all users (admin only)."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, username, display_name, role, is_active, created_at FROM users ORDER BY created_at"
+            "SELECT id, username, display_name, role, is_active, must_change_password, created_at FROM users ORDER BY created_at"
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -444,9 +531,118 @@ async def mark_voucher_posted(voucher_id: str, posted_by: str) -> bool:
         await db.close()
 
 
+async def mark_voucher_reversed(voucher_id: str, reversed_by: str, reason: str) -> bool:
+    """Mark a voucher as reversed. Returns True if updated."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """UPDATE voucher_records
+               SET status = 'reversed', reversed_at = ?, reversed_by = ?, reversal_reason = ?
+               WHERE voucher_id = ? AND status = 'posted'""",
+            (datetime.now().isoformat(), reversed_by, reason, voucher_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def create_reversal_voucher(original_voucher_id: str, user_id: str, reason: str) -> str | None:
+    """Create a reversal (red-letter) voucher for a posted voucher. Returns new voucher_id or None."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM voucher_records WHERE voucher_id = ? AND status = 'posted'",
+            (original_voucher_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        original = dict(row)
+        voucher_data = json.loads(original.get("voucher_data") or "{}")
+
+        # Swap debit/credit in line items
+        rows = voucher_data.get("rows", [])
+        reversal_rows = []
+        for r in rows:
+            new_r = dict(r)
+            old_debit = new_r.get("debit", 0)
+            old_credit = new_r.get("credit", 0)
+            new_r["debit"] = old_credit
+            new_r["credit"] = old_debit
+            new_r["dc"] = "H" if old_debit > 0 else "S"
+            # Prefix summary with reversal note
+            orig_summary = new_r.get("text", "")
+            new_r["text"] = f"冲销{original_voucher_id}: {orig_summary}" if orig_summary else f"冲销{original_voucher_id}"
+            reversal_rows.append(new_r)
+
+        reversal_data = dict(voucher_data)
+        reversal_data["rows"] = reversal_rows
+        reversal_data["header_text"] = f"冲销凭证 {original_voucher_id} - {reason}"
+
+        new_voucher_id = f"REV-{original_voucher_id}"
+        now = datetime.now().isoformat()
+        record_id = str(uuid.uuid4())
+
+        await db.execute(
+            """INSERT INTO voucher_records
+               (id, voucher_id, session_id, user_id, company_code, document_type,
+                document_date, posting_date, reference, header_text, confidence,
+                warnings, voucher_data, status, created_at, posted_at, posted_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted', ?, ?, ?)""",
+            (
+                record_id, new_voucher_id, original.get("session_id"), user_id,
+                original.get("company_code", ""), original.get("document_type", ""),
+                original.get("document_date", ""), original.get("posting_date", ""),
+                original.get("reference", ""), reversal_data["header_text"],
+                original.get("confidence", ""),
+                json.dumps([], ensure_ascii=False),
+                json.dumps(reversal_data, ensure_ascii=False),
+                now, now, user_id,
+            ),
+        )
+        await db.commit()
+        return new_voucher_id
+    finally:
+        await db.close()
+
+
+async def batch_mark_voucher_posted(voucher_ids: list[str], posted_by: str) -> dict:
+    """Batch mark vouchers as posted. Returns {posted: int, failed: int, errors: list}."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        posted = 0
+        errors = []
+        for vid in voucher_ids:
+            try:
+                cursor = await db.execute(
+                    """UPDATE voucher_records
+                       SET status = 'posted', posted_at = ?, posted_by = ?
+                       WHERE voucher_id = ? AND status = 'draft'""",
+                    (now, posted_by, vid),
+                )
+                if cursor.rowcount > 0:
+                    posted += 1
+                else:
+                    errors.append(f"{vid}: 不存在或非草稿状态")
+            except Exception as e:
+                errors.append(f"{vid}: {str(e)}")
+        await db.commit()
+        return {"posted": posted, "failed": len(voucher_ids) - posted, "errors": errors}
+    finally:
+        await db.close()
+
+
 async def list_voucher_records(
     user_id: str | None = None,
     status: str | None = None,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict]:
@@ -462,6 +658,18 @@ async def list_voucher_records(
         if status:
             conditions.append("vr.status = ?")
             params.append(status)
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(vr.header_text LIKE ? OR vr.reference LIKE ? OR vr.voucher_data LIKE ?)"
+            )
+            params.extend([like, like, like])
+        if date_from:
+            conditions.append("vr.document_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("vr.document_date <= ?")
+            params.append(date_to)
 
         where = " AND ".join(conditions) if conditions else "1=1"
         params.extend([limit, offset])
@@ -511,7 +719,13 @@ async def get_voucher_record(voucher_id: str) -> dict | None:
         await db.close()
 
 
-async def count_voucher_records(user_id: str | None = None, status: str | None = None) -> int:
+async def count_voucher_records(
+    user_id: str | None = None,
+    status: str | None = None,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> int:
     """Count voucher records with optional filters."""
     db = await get_db()
     try:
@@ -523,6 +737,18 @@ async def count_voucher_records(user_id: str | None = None, status: str | None =
         if status:
             conditions.append("status = ?")
             params.append(status)
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(header_text LIKE ? OR reference LIKE ? OR voucher_data LIKE ?)"
+            )
+            params.extend([like, like, like])
+        if date_from:
+            conditions.append("document_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("document_date <= ?")
+            params.append(date_to)
         where = " AND ".join(conditions) if conditions else "1=1"
         cursor = await db.execute(f"SELECT COUNT(*) FROM voucher_records WHERE {where}", params)
         row = await cursor.fetchone()

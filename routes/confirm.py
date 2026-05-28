@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from helpers.auth import _get_session, _require_auth, _save_session
 from helpers.csv_export import POSTED_CSV, _append_posted_csv, _append_posted_csv_from_record
-from database import add_audit_log, get_voucher_record, mark_voucher_posted, save_chat_message
+from database import add_audit_log, batch_mark_voucher_posted, get_voucher_record, mark_voucher_posted, save_chat_message
 
 logger = logging.getLogger(__name__)
 
@@ -63,4 +63,30 @@ async def confirm_voucher(payload: dict, request: Request):
     return JSONResponse({
         "status": "posted",
         "message": f"凭证 {voucher_id} 已成功过账，保存至 {POSTED_CSV.name}",
+    })
+
+
+@router.post("/api/confirm/batch")
+async def confirm_voucher_batch(payload: dict, request: Request):
+    """Batch post multiple draft vouchers."""
+    user = await _require_auth(request)
+    voucher_ids = payload.get("voucher_ids", [])
+    if not voucher_ids:
+        return JSONResponse({"error": "请选择至少一个凭证"}, status_code=400)
+    if len(voucher_ids) > 100:
+        return JSONResponse({"error": "单次最多批量过账100个凭证"}, status_code=400)
+
+    result = await batch_mark_voucher_posted(voucher_ids, user["id"])
+
+    await add_audit_log(
+        action="voucher.batch_post", user_id=user["id"], username=user["username"],
+        details={"voucher_ids": voucher_ids, "posted": result["posted"], "failed": result["failed"]},
+    )
+
+    return JSONResponse({
+        "status": "ok",
+        "posted": result["posted"],
+        "failed": result["failed"],
+        "errors": result["errors"],
+        "message": f"批量过账完成：成功 {result['posted']} 个，失败 {result['failed']} 个",
     })

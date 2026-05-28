@@ -11,13 +11,16 @@ from helpers.auth import _require_auth
 from helpers.csv_export import _append_posted_csv_from_record
 from database import (
     add_audit_log,
+    batch_mark_voucher_posted,
     count_voucher_records,
+    create_reversal_voucher,
     get_rule,
     get_voucher_record,
     list_attachments,
     list_rules,
     list_voucher_records,
     mark_voucher_posted,
+    mark_voucher_reversed,
     update_voucher_record,
 )
 from helpers.voucher import _format_rules_for_frontend
@@ -64,6 +67,87 @@ async def handle_a2ui_action(request: Request):
             "a2ui": {"messages": _voucher_list_to_a2ui(records, total, status_filter or None)},
         })
 
+    if event_name == "search_vouchers":
+        keyword = event_data.get("keyword", "").strip()
+        status_filter = event_data.get("status", "")
+        user_id = None if user["role"] == "admin" else user["id"]
+        records = await list_voucher_records(
+            user_id=user_id, status=status_filter or None, keyword=keyword or None, limit=50, offset=0,
+        )
+        total = await count_voucher_records(
+            user_id=user_id, status=status_filter or None, keyword=keyword or None,
+        )
+        return JSONResponse({
+            "status": "ok",
+            "a2ui": {"messages": _voucher_list_to_a2ui(records, total, status_filter or None, keyword=keyword)},
+        })
+
+    if event_name == "batch_post_vouchers":
+        voucher_ids = event_data.get("voucherIds", [])
+        if not voucher_ids:
+            return JSONResponse({"status": "error", "message": "请先勾选要过账的凭证"})
+        result = await batch_mark_voucher_posted(voucher_ids, user["id"])
+        await add_audit_log(
+            action="voucher.batch_post", user_id=user["id"], username=user["username"],
+            details={"voucher_ids": voucher_ids, "posted": result["posted"], "failed": result["failed"]},
+        )
+        # Refresh the list
+        user_id = None if user["role"] == "admin" else user["id"]
+        records = await list_voucher_records(user_id=user_id, limit=50, offset=0)
+        total = await count_voucher_records(user_id=user_id)
+        return JSONResponse({
+            "status": "ok",
+            "message": f"批量过账完成：成功 {result['posted']} 个，失败 {result['failed']} 个",
+            "a2ui": {"messages": _voucher_list_to_a2ui(records, total, None)},
+        })
+
+    if event_name == "reverse_voucher":
+        voucher_id = event_data.get("voucherId", "")
+        reason = event_data.get("reason", "").strip()
+        if not voucher_id:
+            return JSONResponse({"status": "error", "message": "缺少凭证ID"})
+        if not reason:
+            return JSONResponse({"status": "error", "message": "请输入冲销原因"})
+        db_record = await get_voucher_record(voucher_id)
+        if not db_record:
+            return JSONResponse({"status": "error", "message": f"凭证 {voucher_id} 不存在"})
+        if db_record.get("status") != "posted":
+            return JSONResponse({"status": "error", "message": "只有已过账凭证才能冲销"})
+        new_voucher_id = await create_reversal_voucher(voucher_id, user["id"], reason)
+        if not new_voucher_id:
+            return JSONResponse({"status": "error", "message": "冲销失败"})
+        await mark_voucher_reversed(voucher_id, user["id"], reason)
+        await add_audit_log(
+            action="voucher.reverse", user_id=user["id"], username=user["username"],
+            target_type="voucher", target_id=voucher_id,
+            details={"reversal_voucher_id": new_voucher_id, "reason": reason},
+        )
+        # Return the reversal voucher detail
+        reversal_record = await get_voucher_record(new_voucher_id)
+        if reversal_record:
+            reversal_front = json.loads(reversal_record.get("voucher_data") or "{}")
+            reversal_front["status"] = "posted"
+            attachments = await list_attachments(new_voucher_id)
+            return JSONResponse({
+                "status": "ok",
+                "message": f"凭证 {voucher_id} 已冲销，冲销凭证号：{new_voucher_id}",
+                "a2ui": {"messages": _voucher_to_a2ui(reversal_front, new_voucher_id, show_actions=True, attachments=attachments)},
+            })
+        return JSONResponse({
+            "status": "ok",
+            "message": f"凭证 {voucher_id} 已冲销，冲销凭证号：{new_voucher_id}",
+        })
+
+    if event_name == "export_voucher_pdf":
+        voucher_id = event_data.get("voucherId", "")
+        if not voucher_id:
+            return JSONResponse({"status": "error", "message": "缺少凭证ID"})
+        return JSONResponse({
+            "status": "ok",
+            "message": f"正在下载凭证 {voucher_id} 的 PDF...",
+            "downloadUrl": f"/api/vouchers/{voucher_id}/pdf",
+        })
+
     if event_name == "create_rule":
         rule_type = event_data.get("ruleType", "")
         return JSONResponse({
@@ -90,11 +174,10 @@ async def handle_a2ui_action(request: Request):
             return JSONResponse({"status": "error", "message": f"凭证 {voucher_id} 不存在"})
         voucher_front = json.loads(db_record.get("voucher_data") or "{}")
         voucher_front["status"] = db_record.get("status", "draft")
-        show_actions = event_name == "edit_voucher"
         attachments = await list_attachments(voucher_id)
         resp = {
             "status": "ok",
-            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_id, show_actions=show_actions, attachments=attachments)},
+            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_id, show_actions=True, attachments=attachments)},
         }
         if event_name == "edit_voucher":
             resp["voucher"] = voucher_front

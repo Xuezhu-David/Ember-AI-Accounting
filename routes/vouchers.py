@@ -1,17 +1,19 @@
-"""Voucher list, detail, and update routes."""
+"""Voucher list, detail, update, reversal, and PDF export routes."""
 
 import json
 import logging
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from helpers.auth import _require_auth
 from database import (
     add_audit_log,
     count_voucher_records,
+    create_reversal_voucher,
     get_voucher_record,
     list_voucher_records,
+    mark_voucher_reversed,
     update_voucher_record,
 )
 
@@ -21,11 +23,25 @@ router = APIRouter()
 
 
 @router.get("/api/vouchers")
-async def api_list_vouchers(request: Request, status: str | None = None, limit: int = 50, offset: int = 0):
+async def api_list_vouchers(
+    request: Request,
+    status: str | None = None,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
     user = await _require_auth(request)
     user_id = None if user["role"] == "admin" else user["id"]
-    records = await list_voucher_records(user_id=user_id, status=status, limit=limit, offset=offset)
-    total = await count_voucher_records(user_id=user_id, status=status)
+    records = await list_voucher_records(
+        user_id=user_id, status=status, keyword=keyword,
+        date_from=date_from, date_to=date_to, limit=limit, offset=offset,
+    )
+    total = await count_voucher_records(
+        user_id=user_id, status=status, keyword=keyword,
+        date_from=date_from, date_to=date_to,
+    )
     return JSONResponse({"vouchers": records, "total": total, "limit": limit, "offset": offset})
 
 
@@ -78,3 +94,63 @@ async def api_update_voucher(voucher_id: str, payload: dict, request: Request):
         target_type="voucher", target_id=voucher_id,
     )
     return JSONResponse({"status": "ok", "message": f"凭证 {voucher_id} 已更新"})
+
+
+@router.post("/api/vouchers/{voucher_id}/reverse")
+async def api_reverse_voucher(voucher_id: str, payload: dict, request: Request):
+    """Reverse a posted voucher: mark original as reversed, create a red-letter reversal voucher."""
+    user = await _require_auth(request)
+    reason = payload.get("reason", "").strip()
+    if not reason:
+        return JSONResponse({"error": "请输入冲销原因"}, status_code=400)
+
+    record = await get_voucher_record(voucher_id)
+    if not record:
+        return JSONResponse({"error": "凭证不存在"}, status_code=404)
+    if record.get("status") != "posted":
+        return JSONResponse({"error": "只有已过账凭证才能冲销"}, status_code=400)
+    if user["role"] != "admin" and record["user_id"] != user["id"]:
+        return JSONResponse({"error": "无权冲销此凭证"}, status_code=403)
+
+    # Create reversal voucher
+    new_voucher_id = await create_reversal_voucher(voucher_id, user["id"], reason)
+    if not new_voucher_id:
+        return JSONResponse({"error": "冲销失败"}, status_code=500)
+
+    # Mark original as reversed
+    await mark_voucher_reversed(voucher_id, user["id"], reason)
+
+    await add_audit_log(
+        action="voucher.reverse", user_id=user["id"], username=user["username"],
+        target_type="voucher", target_id=voucher_id,
+        details={"reversal_voucher_id": new_voucher_id, "reason": reason},
+    )
+
+    return JSONResponse({
+        "status": "ok",
+        "message": f"凭证 {voucher_id} 已冲销，冲销凭证号：{new_voucher_id}",
+        "original_voucher_id": voucher_id,
+        "reversal_voucher_id": new_voucher_id,
+    })
+
+
+@router.get("/api/vouchers/{voucher_id}/pdf")
+async def api_export_voucher_pdf(voucher_id: str, request: Request):
+    """Export a voucher as PDF."""
+    user = await _require_auth(request)
+    record = await get_voucher_record(voucher_id)
+    if not record:
+        return JSONResponse({"error": "凭证不存在"}, status_code=404)
+    if user["role"] != "admin" and record["user_id"] != user["id"]:
+        return JSONResponse({"error": "无权导出此凭证"}, status_code=403)
+
+    from helpers.pdf_export import generate_voucher_pdf
+    pdf_bytes = await generate_voucher_pdf(record)
+    if not pdf_bytes:
+        return JSONResponse({"error": "PDF 生成失败"}, status_code=500)
+
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="voucher_{voucher_id}.pdf"'},
+    )

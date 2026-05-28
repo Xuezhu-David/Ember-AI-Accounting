@@ -6,10 +6,12 @@ Run:
 """
 
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from agentscope.workspace import LocalWorkspace
@@ -17,7 +19,7 @@ from agents.intent_agent import IntentAgent
 from agents.voucher_agent import VoucherAgent
 from agents.ocr_agent import OcrAgent
 
-from database import init_db, migrate_rules_from_excel, seed_default_rules
+from database import init_db, migrate_rules_from_excel, seed_default_rules, clean_expired_sessions
 
 from routes import auth, chat, upload, vouchers, rules, audit, attachments, confirm, a2ui_action
 
@@ -42,9 +44,12 @@ PROJECT_ROOT = Path(__file__).parent
 
 app = FastAPI(title="Ember AI Accounting", version="2.0")
 
+_cors_origins = os.environ.get("CORS_ORIGINS", "http://localhost:8000")
+_origins_list = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -68,6 +73,7 @@ app.include_router(a2ui_action.router)
 async def startup():
     await init_db()
     logger.info("Database initialized")
+    await clean_expired_sessions()
     migrated = await migrate_rules_from_excel()
     if migrated:
         logger.info("Migrated %d rules from Excel to database", migrated)
@@ -92,6 +98,14 @@ async def shutdown():
     if workspace:
         await workspace.close()
         logger.info("Workspace closed")
+
+
+# ── Health check ─────────────────────────────────────────────────────────────
+
+
+@app.get("/api/health")
+async def health_check():
+    return JSONResponse({"status": "ok", "version": "2.0"})
 
 
 # ── Serve static frontend ────────────────────────────────────────────────────

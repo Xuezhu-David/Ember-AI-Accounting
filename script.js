@@ -209,6 +209,10 @@ document.addEventListener('DOMContentLoaded', () => {
             chatHistory.innerHTML = '';
             if (voucherWorkspaceContent) voucherWorkspaceContent.style.display = 'none';
             showApp();
+
+            if (data.user.must_change_password) {
+                showChangePasswordModal(true);
+            }
         } catch (err) {
             loginError.textContent = '网络错误，请重试';
             loginError.style.display = 'block';
@@ -239,6 +243,96 @@ document.addEventListener('DOMContentLoaded', () => {
             await apiFetch('/api/auth/logout', { method: 'POST' });
         } catch {}
         handleLogout();
+    });
+
+    // ── Password Change Modal ────────────────────────────────────────────────
+
+    const passwordModal = document.getElementById('passwordModal');
+    const passwordModalClose = document.getElementById('passwordModalClose');
+    const passwordCancelBtn = document.getElementById('passwordCancelBtn');
+    const passwordSaveBtn = document.getElementById('passwordSaveBtn');
+    const changePasswordBtn = document.getElementById('changePasswordBtn');
+    const oldPasswordInput = document.getElementById('oldPassword');
+    const newPasswordInput = document.getElementById('newPassword');
+    const confirmPasswordInput = document.getElementById('confirmPassword');
+    const passwordError = document.getElementById('passwordError');
+    let _forcePasswordChange = false;
+
+    function showChangePasswordModal(force = false) {
+        _forcePasswordChange = force;
+        passwordModal.style.display = 'flex';
+        oldPasswordInput.value = '';
+        newPasswordInput.value = '';
+        confirmPasswordInput.value = '';
+        passwordError.style.display = 'none';
+        if (force) {
+            document.getElementById('passwordModalTitle').textContent = '请修改初始密码';
+            passwordModalClose.style.display = 'none';
+            passwordCancelBtn.style.display = 'none';
+        } else {
+            document.getElementById('passwordModalTitle').textContent = '修改密码';
+            passwordModalClose.style.display = '';
+            passwordCancelBtn.style.display = '';
+        }
+        oldPasswordInput.focus();
+    }
+
+    function hideChangePasswordModal() {
+        if (_forcePasswordChange) return;
+        passwordModal.style.display = 'none';
+    }
+
+    passwordModalClose.addEventListener('click', hideChangePasswordModal);
+    passwordCancelBtn.addEventListener('click', hideChangePasswordModal);
+    changePasswordBtn.addEventListener('click', () => showChangePasswordModal(false));
+
+    passwordSaveBtn.addEventListener('click', async () => {
+        const oldPwd = oldPasswordInput.value;
+        const newPwd = newPasswordInput.value;
+        const confirmPwd = confirmPasswordInput.value;
+        passwordError.style.display = 'none';
+
+        if (!oldPwd || !newPwd) {
+            passwordError.textContent = '请输入旧密码和新密码';
+            passwordError.style.display = 'block';
+            return;
+        }
+        if (newPwd.length < 6) {
+            passwordError.textContent = '新密码至少6位';
+            passwordError.style.display = 'block';
+            return;
+        }
+        if (newPwd !== confirmPwd) {
+            passwordError.textContent = '两次输入的新密码不一致';
+            passwordError.style.display = 'block';
+            return;
+        }
+
+        passwordSaveBtn.disabled = true;
+        passwordSaveBtn.textContent = '修改中...';
+        try {
+            const resp = await apiFetch('/api/auth/password', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ old_password: oldPwd, new_password: newPwd }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                passwordError.textContent = data.error || '修改失败';
+                passwordError.style.display = 'block';
+                return;
+            }
+            _forcePasswordChange = false;
+            passwordModal.style.display = 'none';
+            if (currentUser) currentUser.must_change_password = false;
+            addMessage('密码修改成功', 'ai');
+        } catch {
+            passwordError.textContent = '网络错误，请重试';
+            passwordError.style.display = 'block';
+        } finally {
+            passwordSaveBtn.disabled = false;
+            passwordSaveBtn.textContent = '确认修改';
+        }
     });
 
     // ── Chat Logic ────────────────────────────────────────────────────────────
@@ -436,6 +530,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 'KeyValue': this.renderKeyValue.bind(this),
                 'FilterTabs': this.renderFilterTabs.bind(this),
                 'Badge': this.renderBadge.bind(this),
+                'SearchInput': this.renderSearchInput.bind(this),
             };
             return map[type];
         }
@@ -571,6 +666,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const variant = comp.variant || 'secondary';
             el.className = `a2ui-btn a2ui-btn-${variant}`;
             if (comp.disabled) el.disabled = true;
+            // Add data attribute for batch post button
+            if (comp.id === 'batch-post-btn') el.dataset.batchPostBtn = '';
             // Button text from child component
             if (comp.child && this.components[comp.child]) {
                 el.appendChild(this.renderComponent(this.components[comp.child]));
@@ -655,19 +752,59 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // ── Custom Extension Renderers ──
 
+        renderSearchInput(comp) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'a2ui-search-input';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.placeholder = comp.placeholder || '搜索...';
+            input.value = comp.value || '';
+            input.className = 'a2ui-search-field';
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    const action = comp.action;
+                    if (action?.event) {
+                        this.handleAction({ event: { name: action.event.name, data: { keyword: input.value } } });
+                    }
+                }
+            });
+            wrapper.appendChild(input);
+            return wrapper;
+        }
+
         renderDataTable(comp) {
             const wrapper = document.createElement('div');
             wrapper.className = 'a2ui-table-wrapper';
             const table = document.createElement('table');
             table.className = 'a2ui-table';
+            const isSelectable = comp.selectable === true;
+            const selectedIds = new Set();
 
             // Header
             const thead = document.createElement('thead');
             const headerRow = document.createElement('tr');
             for (const col of (comp.columns || [])) {
                 const th = document.createElement('th');
-                th.textContent = col.label || col.key;
-                if (col.align) th.style.textAlign = col.align;
+                if (col.key === 'select' && isSelectable) {
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.title = '全选';
+                    cb.addEventListener('change', () => {
+                        const checkboxes = tbody.querySelectorAll('input[data-select-cb]');
+                        checkboxes.forEach(c => {
+                            c.checked = cb.checked;
+                            const vid = c.dataset.voucherId;
+                            if (cb.checked) selectedIds.add(vid);
+                            else selectedIds.delete(vid);
+                        });
+                        updateBatchBtn();
+                    });
+                    th.appendChild(cb);
+                    th.style.width = col.width || '36px';
+                } else {
+                    th.textContent = col.label || col.key;
+                    if (col.align) th.style.textAlign = col.align;
+                }
                 headerRow.appendChild(th);
             }
             thead.appendChild(headerRow);
@@ -679,14 +816,28 @@ document.addEventListener('DOMContentLoaded', () => {
                 const tr = document.createElement('tr');
                 for (const col of (comp.columns || [])) {
                     const td = document.createElement('td');
-                    td.textContent = row[col.key] ?? '';
-                    if (col.align) td.style.textAlign = col.align;
+                    if (col.key === 'select' && isSelectable) {
+                        const cb = document.createElement('input');
+                        cb.type = 'checkbox';
+                        cb.dataset.selectCb = '';
+                        cb.dataset.voucherId = row['voucher_id'] || '';
+                        cb.addEventListener('change', () => {
+                            if (cb.checked) selectedIds.add(cb.dataset.voucherId);
+                            else selectedIds.delete(cb.dataset.voucherId);
+                            updateBatchBtn();
+                        });
+                        td.appendChild(cb);
+                    } else {
+                        td.textContent = row[col.key] ?? '';
+                        if (col.align) td.style.textAlign = col.align;
+                    }
                     tr.appendChild(td);
                 }
-                // Row click action
+                // Row click action (but not on checkbox clicks)
                 if (comp.rowAction) {
                     tr.className = 'a2ui-table-clickable';
-                    tr.addEventListener('click', () => {
+                    tr.addEventListener('click', (e) => {
+                        if (e.target.type === 'checkbox') return;
                         const action = this.resolveActionTemplate(comp.rowAction, row);
                         this.handleAction(action);
                     });
@@ -694,6 +845,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 tbody.appendChild(tr);
             }
             table.appendChild(tbody);
+
+            // Update batch button state
+            function updateBatchBtn() {
+                const batchBtn = document.querySelector('[data-batch-post-btn]');
+                if (batchBtn) {
+                    batchBtn.textContent = selectedIds.size > 0 ? `批量过账 (${selectedIds.size})` : '批量过账';
+                    batchBtn.disabled = selectedIds.size === 0;
+                }
+                // Store selected IDs on wrapper for access by action handler
+                wrapper._selectedIds = selectedIds;
+            }
 
             // Footer
             if (comp.footer) {
@@ -828,6 +990,65 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Show loading feedback for confirm actions
                 if (eventName === 'confirm_voucher') {
                     addMessage('正在过账...', 'ai');
+                }
+
+                // Special handling for search: read keyword from search input
+                if (eventName === 'search_vouchers') {
+                    const searchInput = document.querySelector('.a2ui-search-field');
+                    if (searchInput) {
+                        payload.data.keyword = searchInput.value;
+                    }
+                }
+
+                // Special handling for batch post: collect selected voucher IDs
+                if (eventName === 'batch_post_vouchers') {
+                    const tableWrapper = document.querySelector('.a2ui-table-wrapper');
+                    if (tableWrapper && tableWrapper._selectedIds) {
+                        payload.data.voucherIds = Array.from(tableWrapper._selectedIds);
+                    }
+                    if (!payload.data.voucherIds || payload.data.voucherIds.length === 0) {
+                        addMessage('请先勾选要过账的凭证', 'ai');
+                        if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '批量过账'; }
+                        return;
+                    }
+                    addMessage(`正在批量过账 ${payload.data.voucherIds.length} 个凭证...`, 'ai');
+                }
+
+                // Special handling for reverse voucher: show confirmation dialog
+                if (eventName === 'reverse_voucher') {
+                    const reason = prompt('请输入冲销原因：');
+                    if (!reason) {
+                        if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '冲销凭证'; }
+                        return;
+                    }
+                    payload.data.reason = reason;
+                    addMessage('正在冲销凭证...', 'ai');
+                }
+
+                // Special handling for PDF export: fetch with auth and download
+                if (eventName === 'export_voucher_pdf') {
+                    const voucherId = payload.data.voucherId;
+                    if (voucherId) {
+                        addMessage(`正在生成凭证 ${voucherId} 的 PDF...`, 'ai');
+                        fetch(`/api/vouchers/${voucherId}/pdf`, {
+                            headers: { 'Authorization': 'Bearer ' + authToken },
+                        }).then(resp => {
+                            if (!resp.ok) throw new Error('下载失败');
+                            return resp.blob();
+                        }).then(blob => {
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `voucher_${voucherId}.pdf`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                            addMessage(`凭证 ${voucherId} 的 PDF 已下载`, 'ai');
+                        }).catch(err => {
+                            addMessage('PDF 下载失败：' + err.message, 'ai');
+                        });
+                    }
+                    if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '导出 PDF'; }
+                    return;
                 }
                 fetch('/api/a2ui-action', {
                     method: 'POST',

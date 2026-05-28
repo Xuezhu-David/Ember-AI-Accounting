@@ -1,42 +1,79 @@
 """Auth and user management routes."""
 
+import time
+from collections import defaultdict
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from helpers.auth import _get_current_user, _require_admin
+from helpers.auth import _get_current_user, _require_auth, _require_admin
 from database import (
     add_audit_log,
     authenticate_user,
+    change_password,
     create_session_token,
     create_user,
     delete_session,
     delete_user,
     list_users,
     update_user,
+    verify_password,
+    get_db,
 )
 
 router = APIRouter()
+
+# ── Login rate limiting ──────────────────────────────────────────────────────
+
+_login_failures: dict[str, tuple[int, float]] = defaultdict(lambda: (0, 0.0))
+_MAX_FAILS = 5
+_LOCKOUT_SECONDS = 300
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if the IP is rate-limited."""
+    count, last_fail = _login_failures[ip]
+    if count >= _MAX_FAILS and (time.time() - last_fail) < _LOCKOUT_SECONDS:
+        return True
+    if (time.time() - last_fail) >= _LOCKOUT_SECONDS:
+        _login_failures[ip] = (0, 0.0)
+    return False
+
+
+def _record_failure(ip: str) -> None:
+    count, _ = _login_failures[ip]
+    _login_failures[ip] = (count + 1, time.time())
+
+
+def _clear_failures(ip: str) -> None:
+    _login_failures.pop(ip, None)
+
+
+# ── Auth routes ──────────────────────────────────────────────────────────────
 
 
 @router.post("/api/auth/login")
 async def login(payload: dict, request: Request):
     username = payload.get("username", "").strip()
     password = payload.get("password", "")
+    ip = request.client.host if request.client else "unknown"
 
     if not username or not password:
         return JSONResponse({"error": "请输入用户名和密码"}, status_code=400)
 
+    if _check_rate_limit(ip):
+        return JSONResponse({"error": "登录失败次数过多，请5分钟后再试"}, status_code=429)
+
     user = await authenticate_user(username, password)
     if not user:
-        await add_audit_log(action="login.failed", username=username, ip_address=request.client.host if request.client else None)
+        _record_failure(ip)
+        await add_audit_log(action="login.failed", username=username, ip_address=ip)
         return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
 
+    _clear_failures(ip)
     token = await create_session_token(user["id"])
     await add_audit_log(
-        action="login.success",
-        user_id=user["id"],
-        username=user["username"],
-        ip_address=request.client.host if request.client else None,
+        action="login.success", user_id=user["id"], username=user["username"], ip_address=ip,
     )
     return JSONResponse({"token": token, "user": user})
 
@@ -59,6 +96,44 @@ async def get_me(request: Request):
     if not user:
         return JSONResponse({"error": "未登录"}, status_code=401)
     return JSONResponse({"user": user})
+
+
+@router.put("/api/auth/password")
+async def api_change_password(payload: dict, request: Request):
+    """Change current user's password."""
+    user = await _require_auth(request)
+    old_password = payload.get("old_password", "")
+    new_password = payload.get("new_password", "")
+
+    if not old_password or not new_password:
+        return JSONResponse({"error": "请输入旧密码和新密码"}, status_code=400)
+    if len(new_password) < 6:
+        return JSONResponse({"error": "新密码至少6位"}, status_code=400)
+
+    # Verify old password
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT password_hash, password_salt FROM users WHERE id = ?", (user["id"],)
+        )
+        row = await cursor.fetchone()
+    finally:
+        await db.close()
+
+    if not row or not verify_password(old_password, row["password_hash"], row["password_salt"]):
+        return JSONResponse({"error": "旧密码错误"}, status_code=400)
+
+    ok = await change_password(user["id"], new_password)
+    if not ok:
+        return JSONResponse({"error": "修改失败"}, status_code=500)
+
+    await add_audit_log(
+        action="password.change", user_id=user["id"], username=user["username"],
+    )
+    return JSONResponse({"status": "ok", "message": "密码修改成功"})
+
+
+# ── User management ──────────────────────────────────────────────────────────
 
 
 @router.get("/api/users")
