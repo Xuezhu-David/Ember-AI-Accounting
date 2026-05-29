@@ -9,17 +9,19 @@ def _sse(data: dict) -> bytes:
 
 
 def _extract_reply_delta(accumulated: str, last_len: int) -> str:
-    """Try to parse accumulated JSON text and extract the reply field's new portion."""
-    try:
-        idx = accumulated.find('"reply"')
-        if idx < 0:
+    """Extract the new portion of the reply field from partially-accumulated JSON.
+
+    Tries to parse the accumulated text as complete JSON first, then falls back
+    to completing the string with a closing quote and brace so partial JSON can
+    be decoded correctly — handling all standard JSON escape sequences.
+    """
+    for candidate in (accumulated, accumulated + '"}\n}', accumulated + '"}'):
+        try:
+            data = json.loads(candidate)
+            reply = data.get("reply", "")
+            if len(reply) > last_len:
+                return reply[last_len:]
             return ""
-        colon = accumulated.index(":", idx + 7)
-        quote_start = accumulated.index('"', colon + 1)
-        reply_so_far = accumulated[quote_start + 1:]
-        reply_so_far = reply_so_far.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
-        if len(reply_so_far) > last_len:
-            return reply_so_far[last_len:]
-    except (ValueError, IndexError):
-        pass
+        except (json.JSONDecodeError, AttributeError):
+            continue
     return ""

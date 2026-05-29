@@ -147,6 +147,14 @@ class IntentAgent(Agent):
             logger.warning("Failed to parse LLM response as JSON: %s", raw[:200])
             return None
 
+        # If LLM still returned a transactions array despite instructions, use the last item
+        # (most recent = most likely to match the current user message)
+        if isinstance(data.get("transactions"), list) and data["transactions"]:
+            last = data["transactions"][-1]
+            for key, val in last.items():
+                if data.get(key) is None:
+                    data[key] = val
+
         intent = data.get("intent", "unknown")
         reply = data.get("reply", "")
 
@@ -168,45 +176,63 @@ class IntentAgent(Agent):
         # intent == "business"
         business_type = data.get("business_type", "other")
 
-        if business_type == "expense" and data.get("tax_excluded_amount") is not None and data.get("total_amount") is not None:
-            txn = ExpenseTransaction(
-                transaction_id=data.get("transaction_id", ""),
+        if business_type == "expense":
+            exp_rate = Decimal(str(data.get("tax_rate", "0.06")))
+            exp_excl = data.get("tax_excluded_amount")
+            exp_total = data.get("total_amount")
+            if exp_excl is None and exp_total is not None:
+                exp_excl = Decimal(str(exp_total)) / (1 + exp_rate)
+            if exp_total is None and exp_excl is not None:
+                exp_total = Decimal(str(exp_excl)) * (1 + exp_rate)
+            if exp_excl is not None and exp_total is not None:
+                txn = ExpenseTransaction(
+                    transaction_id=data.get("transaction_id") or str(uuid.uuid4()),
+                    company_code=data.get("company_code", "1000"),
+                    document_date=data.get("document_date", today),
+                    posting_date=data.get("posting_date", today),
+                    vendor_code=data.get("vendor_code", "V99999"),
+                    vendor_name=data.get("vendor_name", "未知商户"),
+                    expense_category=data.get("expense_category", "other"),
+                    receipt_no=data.get("receipt_no", ""),
+                    description=data.get("description", ""),
+                    currency=data.get("currency", "CNY"),
+                    tax_rate=exp_rate,
+                    tax_excluded_amount=Decimal(str(exp_excl)).quantize(Decimal("0.01")),
+                    tax_amount=Decimal(str(data.get("tax_amount") or (Decimal(str(exp_excl)) * exp_rate))).quantize(Decimal("0.01")),
+                    total_amount=Decimal(str(exp_total)).quantize(Decimal("0.01")),
+                    profit_center=data.get("profit_center", "PC-DEFAULT"),
+                    cost_center=data.get("cost_center", "CC-DEFAULT"),
+                )
+                return {"intent": "business", "business_type": business_type, "transaction": txn}
+
+        if business_type == "sales_revenue":
+            # Auto-derive missing amounts from whatever the LLM provided
+            tax_excl = data.get("tax_excluded_amount")
+            total    = data.get("total_amount")
+            tax_rate_val = Decimal(str(data.get("tax_rate", "0.13")))
+            if tax_excl is None and total is not None:
+                # user gave total (含税), back-calculate
+                tax_excl = Decimal(str(total)) / (1 + tax_rate_val)
+            if total is None and tax_excl is not None:
+                total = Decimal(str(tax_excl)) * (1 + tax_rate_val)
+            if tax_excl is None or total is None:
+                return {"intent": "business", "business_type": business_type, "transaction": None}
+
+            txn = SalesTransaction(
+                transaction_id=data.get("transaction_id") or str(uuid.uuid4()),
                 company_code=data.get("company_code", "1000"),
                 document_date=data.get("document_date", today),
                 posting_date=data.get("posting_date", today),
-                vendor_code=data.get("vendor_code", "V99999"),
-                vendor_name=data.get("vendor_name", "未知商户"),
-                expense_category=data.get("expense_category", "other"),
-                receipt_no=data.get("receipt_no", ""),
-                description=data.get("description", ""),
-                currency=data.get("currency", "CNY"),
-                tax_rate=Decimal(str(data.get("tax_rate", "0.06"))),
-                tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-                tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-                total_amount=Decimal(str(data["total_amount"])),
-                profit_center=data.get("profit_center", "PC-DEFAULT"),
-                cost_center=data.get("cost_center", "CC-DEFAULT"),
-            )
-            return {"intent": "business", "business_type": business_type, "transaction": txn}
-
-        if business_type != "sales_revenue" or data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
-            return {"intent": "business", "business_type": business_type, "transaction": None}
-
-        txn = SalesTransaction(
-            transaction_id=data["transaction_id"],
-            company_code=data.get("company_code", "1000"),
-            document_date=data.get("document_date", today),
-            posting_date=data.get("posting_date", today),
             customer_code=data.get("customer_code", "C99999"),
             customer_name=data.get("customer_name", "未知客户"),
             product_type=data.get("product_type", "service"),
             contract_no=data.get("contract_no", ""),
             invoice_no=data.get("invoice_no", ""),
             currency=data.get("currency", "CNY"),
-            tax_rate=Decimal(str(data.get("tax_rate", "0.13"))),
-            tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
-            tax_amount=Decimal(str(data.get("tax_amount", "0"))),
-            total_amount=Decimal(str(data["total_amount"])),
+            tax_rate=tax_rate_val,
+            tax_excluded_amount=Decimal(str(tax_excl)).quantize(Decimal("0.01")),
+            tax_amount=Decimal(str(data.get("tax_amount") or (Decimal(str(tax_excl)) * tax_rate_val))).quantize(Decimal("0.01")),
+            total_amount=Decimal(str(total)).quantize(Decimal("0.01")),
             profit_center=data.get("profit_center", "PC-DEFAULT"),
             cost_center=data.get("cost_center", "CC-DEFAULT"),
         )

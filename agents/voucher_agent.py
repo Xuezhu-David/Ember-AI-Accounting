@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import asdict
+from datetime import date
 from decimal import Decimal
 
 from agentscope.agent import Agent
@@ -14,7 +15,7 @@ from agentscope.tool import FunctionTool, Toolkit
 from prompts import VOUCHER_GENERATION_PROMPT
 from voucher_models import SalesTransaction, ExpenseTransaction, Voucher, VoucherLine
 from voucher_rules import build_sales_revenue_voucher, build_expense_voucher
-from database import list_rules
+from database import list_rules, next_voucher_id
 
 from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
 from .model_factory import create_chat_model
@@ -65,7 +66,7 @@ class VoucherAgent(Agent):
         result_msg = await super().reply(msg)
 
         raw = result_msg.get_text_content() or ""
-        voucher = _parse_llm_response(raw, txn)
+        voucher = await _parse_llm_response(raw, txn)
         if voucher is None:
             logger.warning("LLM voucher parsing failed, falling back to rule engine.")
             voucher = _build_fallback_voucher(txn)
@@ -95,7 +96,7 @@ class VoucherAgent(Agent):
 
         if final_msg:
             raw = final_msg.get_text_content() or ""
-            voucher = _parse_llm_response(raw, txn)
+            voucher = await _parse_llm_response(raw, txn)
             if voucher is None:
                 logger.warning("LLM voucher parsing failed, falling back to rule engine.")
                 voucher = _build_fallback_voucher(txn)
@@ -182,7 +183,7 @@ def _dict_to_sales_transaction(data: dict) -> SalesTransaction:
     )
 
 
-def _parse_llm_response(raw: str, txn: SalesTransaction | ExpenseTransaction) -> Voucher | None:
+async def _parse_llm_response(raw: str, txn: SalesTransaction | ExpenseTransaction) -> Voucher | None:
     """Parse LLM JSON response into a Voucher object. Returns None on failure."""
     json_str = _extract_json(raw)
 
@@ -231,8 +232,14 @@ def _parse_llm_response(raw: str, txn: SalesTransaction | ExpenseTransaction) ->
 
     reference = txn.receipt_no if isinstance(txn, ExpenseTransaction) else txn.invoice_no
 
+    # Generate a unique, sequential voucher ID from the database
+    prefix   = "EXP" if isinstance(txn, ExpenseTransaction) else "SO"
+    date_str = txn.document_date or date.today().strftime("%Y%m%d")
+    date_str = date_str.replace("-", "")
+    voucher_id = await next_voucher_id(prefix, date_str)
+
     return Voucher(
-        voucher_id=f"VR-{txn.transaction_id}",
+        voucher_id=voucher_id,
         company_code=txn.company_code,
         document_type="DR",
         document_date=txn.document_date,

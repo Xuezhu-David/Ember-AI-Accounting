@@ -35,6 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── App State ─────────────────────────────────────────────────────────────
     let isProcessing = false;
+    let _aiAbort = null;   // AbortController for active AI request
     let sessionId = null;
     let pendingFile = null;
     let currentVoucherId = null;
@@ -340,13 +341,21 @@ document.addEventListener('DOMContentLoaded', () => {
     async function sendMessage() {
         const text = userInput.value.trim();
         if (!text && !pendingFile) return;
-        if (isProcessing) return;
+
+        // If processing, clicking again = abort
+        if (isProcessing) {
+            if (_aiAbort) _aiAbort.abort();
+            return;
+        }
 
         addMessage(text || '上传了文件', 'user');
         userInput.value = '';
         resizeTextarea();
 
         isProcessing = true;
+        _aiAbort = new AbortController();
+        const icon = document.getElementById('sendBtnIcon');
+        if (icon) { icon.className = 'ph ph-stop-circle'; sendBtn.title = '停止'; }
         showTypingIndicator();
 
         try {
@@ -357,11 +366,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 await processAIResponse(text);
             }
         } catch (err) {
-            // Clean up any leftover streaming message
             const leftoverStream = document.getElementById('streaming-message');
             if (leftoverStream) leftoverStream.remove();
             removeTypingIndicator();
-            if (err.message && err.message.includes('登录已过期')) {
+            if (err.name === 'AbortError') {
+                addMessage('已停止。', 'ai');
+            } else if (err.message && err.message.includes('登录已过期')) {
                 addMessage('登录已过期，请重新登录。', 'ai');
             } else {
                 addMessage('请求出错：' + (err.message || '未知错误'), 'ai');
@@ -369,6 +379,8 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('[sendMessage] error:', err);
         } finally {
             isProcessing = false;
+            _aiAbort = null;
+            if (icon) { icon.className = 'ph ph-paper-plane-right'; sendBtn.title = '发送'; }
         }
     }
 
@@ -382,44 +394,51 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
         chatHistory.appendChild(msgDiv);
         chatHistory.scrollTop = chatHistory.scrollHeight;
+        return msgDiv.querySelector('.content');
     }
 
     function formatContent(text) {
         return text.replace(/\n/g, '<br>');
     }
 
-    async function consumeSSE(resp, { onDelta, onProgress, onResult, onError }) {
+    async function consumeSSE(resp, { onDelta, onProgress, onResult, onError, signal }) {
         if (!resp.body) throw new Error('响应体为空 (status=' + resp.status + ')');
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                try {
-                    const data = JSON.parse(line.slice(6));
-                    if (data.type === 'delta') onDelta?.(data.text);
-                    else if (data.type === 'progress') onProgress?.(data.text);
-                    else if (data.type === 'result') onResult?.(data);
-                    else if (data.type === 'error') onError?.(data);
-                } catch (e) {
-                    console.warn('SSE parse error:', e, line);
+        try {
+            while (true) {
+                if (signal?.aborted) { reader.cancel(); throw new DOMException('Aborted', 'AbortError'); }
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.type === 'delta') onDelta?.(data.text);
+                        else if (data.type === 'progress') onProgress?.(data.text);
+                        else if (data.type === 'result') onResult?.(data);
+                        else if (data.type === 'error') onError?.(data);
+                    } catch (e) {
+                        console.warn('SSE parse error:', e, line);
+                    }
                 }
             }
-        }
-        if (buffer.trim() && buffer.startsWith('data: ')) {
-            try {
-                const data = JSON.parse(buffer.slice(6));
-                if (data.type === 'result') onResult?.(data);
-                else if (data.type === 'error') onError?.(data);
-            } catch (e) {
-                console.warn('SSE final buffer parse error:', e, buffer);
+            if (buffer.trim() && buffer.startsWith('data: ')) {
+                try {
+                    const data = JSON.parse(buffer.slice(6));
+                    if (data.type === 'result') onResult?.(data);
+                    else if (data.type === 'error') onError?.(data);
+                } catch (e) {
+                    console.warn('SSE final buffer parse error:', e, buffer);
+                }
             }
+        } catch (err) {
+            reader.cancel().catch(() => {});
+            throw err;
         }
     }
 
@@ -1050,6 +1069,43 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '导出 PDF'; }
                     return;
                 }
+
+                // Special handling for CSV export: collect selected IDs and download
+                if (eventName === 'export_vouchers_csv') {
+                    const tableWrapper = document.querySelector('.a2ui-table-wrapper');
+                    let ids = [];
+                    if (tableWrapper && tableWrapper._selectedIds && tableWrapper._selectedIds.size > 0) {
+                        ids = Array.from(tableWrapper._selectedIds);
+                    } else {
+                        // No selection — export all visible rows by reading checkbox data
+                        const cbs = document.querySelectorAll('.a2ui-table-wrapper input[data-select-cb]');
+                        cbs.forEach(cb => { if (cb.dataset.voucherId) ids.push(cb.dataset.voucherId); });
+                    }
+                    if (ids.length === 0) {
+                        addMessage('没有可导出的凭证', 'ai');
+                        if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '导出 CSV'; }
+                        return;
+                    }
+                    addMessage(`正在导出 ${ids.length} 张凭证为 SAP CSV…`, 'ai');
+                    fetch(`/api/export/csv?ids=${ids.join(',')}`, {
+                        headers: { 'Authorization': 'Bearer ' + authToken },
+                    }).then(resp => {
+                        if (!resp.ok) throw new Error('导出失败');
+                        return resp.blob();
+                    }).then(blob => {
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'sap_export.csv';
+                        a.click();
+                        URL.revokeObjectURL(url);
+                        addMessage(`已下载 sap_export.csv（${ids.length} 张凭证）`, 'ai');
+                    }).catch(err => {
+                        addMessage('CSV 导出失败：' + err.message, 'ai');
+                    });
+                    if (btnEl) { btnEl.disabled = false; btnEl.textContent = btnEl.dataset.origText || '导出 CSV'; }
+                    return;
+                }
                 fetch('/api/a2ui-action', {
                     method: 'POST',
                     headers: {
@@ -1098,9 +1154,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // ── Process AI Response ─────────────────────────────────────────────────
 
     async function processAIResponse(input) {
+        const signal = _aiAbort?.signal;
         const resp = await apiFetch('/api/chat', {
             method: 'POST',
             body: JSON.stringify({ message: input, session_id: sessionId }),
+            signal,
         });
 
         let finalData = null;
@@ -1111,6 +1169,7 @@ document.addEventListener('DOMContentLoaded', () => {
             onDelta: (text) => appendStreamingText(streamMsg, text),
             onResult: (data) => { finalData = data; },
             onError: (data) => { errorData = data; },
+            signal,
         });
 
         if (errorData) {
@@ -1167,6 +1226,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function handleFileUpload(file, extraMessage) {
+        const signal = _aiAbort?.signal;
         const formData = new FormData();
         formData.append('file', file);
         if (sessionId) formData.append('session_id', sessionId);
@@ -1174,6 +1234,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const resp = await apiFetch('/api/upload', {
             method: 'POST',
             body: formData,
+            signal,
         });
 
         let finalData = null;
@@ -1187,6 +1248,7 @@ document.addEventListener('DOMContentLoaded', () => {
             },
             onResult: (data) => { finalData = data; },
             onError: (data) => { errorData = data; },
+            signal,
         });
 
         if (errorData) {
@@ -1235,6 +1297,94 @@ document.addEventListener('DOMContentLoaded', () => {
             if (finalData.vouchers.length > 1) {
                 addMessage(`共生成 ${finalData.vouchers.length} 张凭证，当前显示最后一张。`, 'ai');
             }
+        }
+    }
+
+    async function handleBatchUpload(files) {
+        if (isProcessing) { addMessage('请等当前任务完成后再上传', 'ai'); return; }
+
+        isProcessing = true;
+        _aiAbort = new AbortController();
+        const { signal } = _aiAbort;
+        const icon = document.getElementById('sendBtnIcon');
+        if (icon) { icon.className = 'ph ph-stop-circle'; sendBtn.title = '停止'; }
+
+        addMessage(`批量上传 ${files.length} 个文件，逐一处理中…`, 'user');
+        showTypingIndicator();
+
+        const collectedIds = [];
+        const errors = [];
+
+        for (let i = 0; i < files.length; i++) {
+            if (signal.aborted) break;
+            const file = files[i];
+            addMessage(`处理第 ${i + 1}/${files.length} 个：${file.name}`, 'ai');
+
+            const formData = new FormData();
+            formData.append('file', file);
+            if (sessionId) formData.append('session_id', sessionId);
+
+            try {
+                const resp = await apiFetch('/api/upload', { method: 'POST', body: formData, signal });
+                let finalData = null;
+                const streamMsg = addStreamingMessage();
+                await consumeSSE(resp, {
+                    onProgress: (text) => { const el = streamMsg.querySelector('.streaming-text'); if (el) el.textContent = text; },
+                    onResult: (data) => { finalData = data; },
+                    onError: (data) => { throw new Error(data.reply || '处理失败'); },
+                    signal,
+                });
+                if (finalData) {
+                    sessionId = finalData.session_id;
+                    finalizeStreamingMessage(streamMsg, finalData.reply);
+                    const vid = finalData.vouchers?.[0]?.voucher_id;
+                    if (vid) collectedIds.push(vid);
+                } else {
+                    streamMsg.remove();
+                }
+            } catch (err) {
+                if (err.name === 'AbortError') break;
+                errors.push(`${file.name}：${err.message || '失败'}`);
+                addMessage(`⚠ ${file.name} 处理失败：${err.message || '未知错误'}`, 'ai');
+            }
+        }
+
+        removeTypingIndicator();
+        isProcessing = false;
+        _aiAbort = null;
+        if (icon) { icon.className = 'ph ph-paper-plane-right'; sendBtn.title = '发送'; }
+
+        const ok = collectedIds.length;
+        const total = files.length;
+        const aborted = signal.aborted;
+        const summary = aborted
+            ? `已取消。已处理 ${ok + errors.length}/${total} 个文件，生成 ${ok} 张凭证草稿。`
+            : `批量处理完成：共 ${total} 个文件，生成 ${ok} 张凭证草稿${errors.length ? `，${errors.length} 个失败` : ''}。`;
+
+        if (ok > 0) {
+            const msgEl = addMessage(summary, 'ai');
+            // Append download button inside the message bubble
+            const btn = document.createElement('button');
+            btn.className = 'batch-csv-btn';
+            btn.textContent = '⬇ 下载 SAP CSV';
+            btn.onclick = () => {
+                btn.disabled = true;
+                btn.textContent = '准备中…';
+                apiFetch(`/api/export/csv?ids=${collectedIds.join(',')}`)
+                    .then(r => { if (!r.ok) throw new Error('导出失败'); return r.blob(); })
+                    .then(blob => {
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url; a.download = 'sap_export.csv'; a.click();
+                        URL.revokeObjectURL(url);
+                        btn.textContent = '⬇ 下载 SAP CSV';
+                    })
+                    .catch(err => { addMessage('CSV 导出失败：' + err.message, 'ai'); btn.textContent = '⬇ 下载 SAP CSV'; })
+                    .finally(() => { btn.disabled = false; });
+            };
+            msgEl?.appendChild(btn);
+        } else {
+            addMessage(summary, 'ai');
         }
     }
 
@@ -1432,8 +1582,12 @@ document.addEventListener('DOMContentLoaded', () => {
     userInput.addEventListener('input', resizeTextarea);
     uploadBtn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', (e) => {
-        if (e.target.files.length > 0) {
-            pendingFile = e.target.files[0];
+        const files = e.target.files;
+        if (files.length > 1) {
+            handleBatchUpload(Array.from(files));
+            e.target.value = '';
+        } else if (files.length === 1) {
+            pendingFile = files[0];
             userInput.value = `📎 ${pendingFile.name}`;
             resizeTextarea();
         }
@@ -1446,7 +1600,14 @@ document.addEventListener('DOMContentLoaded', () => {
     chatPanel.addEventListener('drop', (e) => {
         e.preventDefault(); e.stopPropagation(); chatPanel.classList.remove('drag-over');
         const files = e.dataTransfer.files;
-        if (files.length > 0) { pendingFile = files[0]; userInput.value = `📎 ${pendingFile.name}`; resizeTextarea(); sendMessage(); }
+        if (files.length > 1) {
+            handleBatchUpload(Array.from(files));
+        } else if (files.length === 1) {
+            pendingFile = files[0];
+            userInput.value = `📎 ${pendingFile.name}`;
+            resizeTextarea();
+            sendMessage();
+        }
     });
 
     createTransactionBtn.addEventListener('click', confirmVoucher);

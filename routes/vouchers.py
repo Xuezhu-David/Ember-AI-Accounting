@@ -13,7 +13,6 @@ from database import (
     create_reversal_voucher,
     get_voucher_record,
     list_voucher_records,
-    mark_voucher_reversed,
     update_voucher_record,
 )
 
@@ -69,6 +68,8 @@ async def api_update_voucher(voucher_id: str, payload: dict, request: Request):
     record = await get_voucher_record(voucher_id)
     if not record:
         return JSONResponse({"error": "凭证不存在"}, status_code=404)
+    if user["role"] != "admin" and record["user_id"] != user["id"]:
+        return JSONResponse({"error": "无权编辑此凭证"}, status_code=403)
     if record.get("status") == "posted":
         return JSONResponse({"error": "已过账的凭证不可编辑"}, status_code=400)
 
@@ -112,13 +113,10 @@ async def api_reverse_voucher(voucher_id: str, payload: dict, request: Request):
     if user["role"] != "admin" and record["user_id"] != user["id"]:
         return JSONResponse({"error": "无权冲销此凭证"}, status_code=403)
 
-    # Create reversal voucher
+    # create_reversal_voucher atomically inserts the reversal and marks the original reversed
     new_voucher_id = await create_reversal_voucher(voucher_id, user["id"], reason)
     if not new_voucher_id:
-        return JSONResponse({"error": "冲销失败"}, status_code=500)
-
-    # Mark original as reversed
-    await mark_voucher_reversed(voucher_id, user["id"], reason)
+        return JSONResponse({"error": "冲销失败，凭证可能已被冲销"}, status_code=400)
 
     await add_audit_log(
         action="voucher.reverse", user_id=user["id"], username=user["username"],

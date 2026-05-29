@@ -1,11 +1,15 @@
 """Authentication and session management helpers."""
 
 import json
+import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 from database import get_user_by_token, list_chat_messages
 from voucher_models import Voucher, VoucherLine
@@ -106,12 +110,20 @@ def _dict_to_voucher(data: dict) -> Voucher:
 
 
 def _session_path(session_id: str) -> Path:
-    return SESSION_DIR / f"{session_id}.json"
+    if not re.fullmatch(r"[a-f0-9\-]{36}", session_id):
+        raise ValueError(f"Invalid session_id: {session_id!r}")
+    path = (SESSION_DIR / f"{session_id}.json").resolve()
+    if not path.is_relative_to(SESSION_DIR.resolve()):
+        raise ValueError("Session path escapes session directory")
+    return path
 
 
 def _load_session(session_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     """Load session from disk. Returns None if session belongs to a different user."""
-    path = _session_path(session_id)
+    try:
+        path = _session_path(session_id)
+    except ValueError:
+        return {"vouchers": [], "uploaded_files": [], "user_id": user_id}
     if path.exists():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -119,13 +131,17 @@ def _load_session(session_id: str, user_id: str | None = None) -> dict[str, Any]
                 return None
             raw["vouchers"] = [_dict_to_voucher(v) for v in raw.get("vouchers", [])]
             return raw
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to load session %s: %s", session_id, exc)
     return {"vouchers": [], "uploaded_files": [], "user_id": user_id}
 
 
 def _save_session(session_id: str, session: dict[str, Any]) -> None:
-    path = _session_path(session_id)
+    try:
+        path = _session_path(session_id)
+    except ValueError:
+        logger.warning("Refused to save session with invalid id: %s", session_id)
+        return
     data = {
         "user_id": session.get("user_id"),
         "vouchers": [_voucher_to_json(v) for v in session.get("vouchers", [])],
@@ -151,6 +167,6 @@ async def _is_session_expired(session_id: str) -> bool:
         return False
     last_msg = recent[0]
     last_time = datetime.fromisoformat(last_msg["created_at"])
-    if datetime.utcnow() - last_time > timedelta(hours=SESSION_TIMEOUT_HOURS):
+    if datetime.now() - last_time > timedelta(hours=SESSION_TIMEOUT_HOURS):
         return True
     return False

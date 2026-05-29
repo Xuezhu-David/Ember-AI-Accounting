@@ -4,6 +4,7 @@ import base64
 import inspect
 import json
 import logging
+import uuid
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -134,7 +135,7 @@ class OcrAgent(Agent):
 
         if business_type == "expense":
             txn = ExpenseTransaction(
-                transaction_id=data.get("transaction_id", ""),
+                transaction_id=data.get("transaction_id") or str(uuid.uuid4()),
                 company_code=data.get("company_code", "1000"),
                 document_date=data.get("document_date", today),
                 posting_date=data.get("posting_date", today),
@@ -154,7 +155,7 @@ class OcrAgent(Agent):
             return {"business_type": business_type, "transaction": txn}
 
         txn = SalesTransaction(
-            transaction_id=data["transaction_id"],
+            transaction_id=data.get("transaction_id") or str(uuid.uuid4()),
             company_code=data.get("company_code", "1000"),
             document_date=data.get("document_date", today),
             posting_date=data.get("posting_date", today),
@@ -207,12 +208,13 @@ def _build_pdf_blocks(pdf_path: Path, today: str) -> list:
 
 
 def _pdf_to_images(pdf_path: Path) -> list[tuple[bytes, str]]:
-    """Convert PDF pages to PNG images."""
+    """Convert PDF pages to PNG images. Processes at most 10 pages."""
     import fitz
 
+    MAX_PAGES = 10
     doc = fitz.open(str(pdf_path))
     pages = []
-    for page in doc:
+    for page in list(doc)[:MAX_PAGES]:
         pix = page.get_pixmap(dpi=200)
         pages.append((pix.tobytes("png"), "image/png"))
     doc.close()

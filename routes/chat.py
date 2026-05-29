@@ -408,9 +408,10 @@ async def _chat_stream(payload: dict, request: Request):
             role_label = "管理员" if new_role == "admin" else "普通用户"
             if not reply:
                 reply = f"已成功创建用户：\n• 用户名：{new_username}\n• 显示名称：{new_display_name}\n• 角色：{role_label}\n• 密码：{new_password}\n\n请通知用户尽快修改密码。"
+            db_reply = f"已成功创建用户：{new_username}（{role_label}），密码已生成，请通知用户尽快修改密码。"
             await save_chat_message(
                 session_id=chat_session_id, user_id=user["id"],
-                role="assistant", content=reply, message_type="chat",
+                role="assistant", content=db_reply, message_type="chat",
                 metadata={"created_user": new_username},
             )
             users = await list_users()

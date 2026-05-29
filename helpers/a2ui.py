@@ -74,9 +74,10 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
     status = voucher_front.get("status", "draft")
     is_posted = status == "posted"
     is_reversed = status == "reversed"
+    is_pending = status == "pending_approval"
 
     # Status badge
-    status_map = {"posted": "已过账", "reversed": "已冲销"}
+    status_map = {"posted": "已过账", "reversed": "已冲销", "pending_approval": "待审批"}
     status_badge = status_map.get(status, "草稿")
 
     components = [
@@ -133,35 +134,62 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
     )
 
     if show_actions:
-        components.extend([
-            {"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn", "reverse-btn", "pdf-btn"]},
-            {"id": "confirm-btn", "component": "Button", "child": "confirm-text",
-             "variant": "primary", "disabled": is_posted or is_reversed,
-             "action": {"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else ("已冲销" if is_reversed else "确认并记账")},
-            {"id": "edit-btn", "component": "Button", "child": "edit-text",
-             "variant": "secondary", "disabled": is_posted or is_reversed,
-             "action": {"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "edit-text", "component": "Text", "text": "编辑凭证"},
-            {"id": "reverse-btn", "component": "Button", "child": "reverse-text",
-             "variant": "danger", "disabled": not is_posted,
-             "action": {"event": {"name": "reverse_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "reverse-text", "component": "Text", "text": "冲销凭证"},
-            {"id": "pdf-btn", "component": "Button", "child": "pdf-text",
-             "variant": "secondary",
-             "action": {"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}},
-            {"id": "pdf-text", "component": "Text", "text": "导出 PDF"},
-        ])
+        if is_pending:
+            # Pending approval: show waiting label + approve/reject for approvers
+            actions_children = ["pending-label", "approve-btn", "reject-btn", "pdf-btn"]
+            components.extend([
+                {"id": "actions-row", "component": "Row", "children": actions_children},
+                {"id": "pending-label", "component": "Text", "text": "⏳ 待审批中"},
+                {"id": "approve-btn", "component": "Button", "child": "approve-text",
+                 "variant": "primary",
+                 "action": {"event": {"name": "approve_voucher", "data": {"voucherId": voucher_id}}}},
+                {"id": "approve-text", "component": "Text", "text": "审批通过"},
+                {"id": "reject-btn", "component": "Button", "child": "reject-text",
+                 "variant": "danger",
+                 "action": {"event": {"name": "reject_voucher", "data": {"voucherId": voucher_id}}}},
+                {"id": "reject-text", "component": "Text", "text": "驳回"},
+                {"id": "pdf-btn", "component": "Button", "child": "pdf-text",
+                 "variant": "secondary",
+                 "action": {"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}},
+                {"id": "pdf-text", "component": "Text", "text": "导出 PDF"},
+            ])
+        else:
+            # Draft / posted / reversed: original flow + submit-approval button for draft
+            actions_children = ["confirm-btn", "submit-approval-btn", "edit-btn", "reverse-btn", "pdf-btn"]
+            components.extend([
+                {"id": "actions-row", "component": "Row", "children": actions_children},
+                {"id": "confirm-btn", "component": "Button", "child": "confirm-text",
+                 "variant": "primary", "disabled": is_posted or is_reversed,
+                 "action": {"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}}},
+                {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else ("已冲销" if is_reversed else "确认并记账")},
+                {"id": "submit-approval-btn", "component": "Button", "child": "submit-approval-text",
+                 "variant": "secondary", "disabled": is_posted or is_reversed,
+                 "action": {"event": {"name": "submit_for_approval", "data": {"voucherId": voucher_id}}}},
+                {"id": "submit-approval-text", "component": "Text", "text": "提交审批"},
+                {"id": "edit-btn", "component": "Button", "child": "edit-text",
+                 "variant": "secondary", "disabled": is_posted or is_reversed,
+                 "action": {"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}}},
+                {"id": "edit-text", "component": "Text", "text": "编辑凭证"},
+                {"id": "reverse-btn", "component": "Button", "child": "reverse-text",
+                 "variant": "danger", "disabled": not is_posted,
+                 "action": {"event": {"name": "reverse_voucher", "data": {"voucherId": voucher_id}}}},
+                {"id": "reverse-text", "component": "Text", "text": "冲销凭证"},
+                {"id": "pdf-btn", "component": "Button", "child": "pdf-text",
+                 "variant": "secondary",
+                 "action": {"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}},
+                {"id": "pdf-text", "component": "Text", "text": "导出 PDF"},
+            ])
     return _build_a2ui_messages("voucher-detail", components)
 
 
 def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None) -> dict:
     """Convert voucher records list to A2UI messages."""
-    status_label = {"draft": "草稿", "posted": "已过账", "reversed": "已冲销"}.get(status_filter, "全部")
+    status_label = {"draft": "草稿", "posted": "已过账", "reversed": "已冲销", "pending_approval": "待审批"}.get(status_filter, "全部")
 
     tabs = [
         {"key": "", "label": "全部"},
         {"key": "draft", "label": "草稿"},
+        {"key": "pending_approval", "label": "待审批"},
         {"key": "posted", "label": "已过账"},
         {"key": "reversed", "label": "已冲销"},
     ]
@@ -178,7 +206,7 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, 
     table_rows = []
     for rec in records:
         st = rec.get("status", "draft")
-        status_text = {"posted": "已过账", "reversed": "已冲销"}.get(st, "草稿")
+        status_text = {"posted": "已过账", "reversed": "已冲销", "pending_approval": "待审批"}.get(st, "草稿")
         table_rows.append({
             "select": "☐",
             "voucher_id": rec.get("voucher_id", ""),
@@ -191,7 +219,7 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, 
 
     components = [
         {"id": "title", "component": "Text", "text": f"凭证列表 — {status_label}（共 {total} 条）", "variant": "h2"},
-        {"id": "search-row", "component": "Row", "children": ["search-input", "search-btn", "batch-post-btn"]},
+        {"id": "search-row", "component": "Row", "children": ["search-input", "search-btn", "batch-post-btn", "export-csv-btn"]},
         {"id": "search-input", "component": "SearchInput", "placeholder": "搜索凭证（摘要、凭证号、客户）",
          "value": keyword or "", "action": {"event": {"name": "search_vouchers"}}},
         {"id": "search-btn", "component": "Button", "child": "search-btn-text",
@@ -201,6 +229,10 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, 
          "variant": "primary", "disabled": True,
          "action": {"event": {"name": "batch_post_vouchers"}}},
         {"id": "batch-post-text", "component": "Text", "text": "批量过账"},
+        {"id": "export-csv-btn", "component": "Button", "child": "export-csv-text",
+         "variant": "secondary",
+         "action": {"event": {"name": "export_vouchers_csv"}}},
+        {"id": "export-csv-text", "component": "Text", "text": "导出 CSV"},
         {"id": "filter-tabs", "component": "FilterTabs",
          "tabs": tabs, "active": status_filter or "",
          "action": {"event": {"name": "filter_vouchers"}}},

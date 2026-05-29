@@ -2,7 +2,6 @@
 
 import json
 import logging
-import shutil
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +37,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 PDF_EXTENSIONS = {".pdf"}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS | {".xlsx", ".xls"}
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
 SUPPORTED_BUSINESS_TYPES = {
     "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
@@ -67,6 +68,16 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
     app = request.app
 
     user = await _require_auth(request)
+
+    suffix = Path(file.filename or "upload").suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        yield _sse({"type": "error", "reply": f"不支持的文件类型 '{suffix}'，支持：xlsx, xls, pdf, png, jpg, jpeg, gif, webp, bmp"})
+        return
+
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        yield _sse({"type": "error", "reply": "文件过大，最大允许 20MB"})
+        return
     chat_session_id = session_id or str(uuid.uuid4())
     session_id, session = _get_session(session_id, user_id=user["id"])
 
@@ -81,8 +92,7 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
     file_id = str(uuid.uuid4())[:8]
     suffix = Path(file.filename or "upload.xlsx").suffix.lower()
     saved_path = UPLOAD_DIR / f"{file_id}{suffix}"
-    with saved_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+    saved_path.write_bytes(content)
 
     file_info = {
         "name": file.filename,

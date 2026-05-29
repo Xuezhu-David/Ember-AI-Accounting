@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from helpers.auth import _get_session, _require_auth, _save_session
 from helpers.csv_export import POSTED_CSV, _append_posted_csv, _append_posted_csv_from_record
-from database import add_audit_log, batch_mark_voucher_posted, get_voucher_record, mark_voucher_posted, save_chat_message
+from database import add_audit_log, batch_mark_voucher_posted, get_voucher_record, list_voucher_records, mark_voucher_posted, save_chat_message
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ async def confirm_voucher(payload: dict, request: Request):
             return JSONResponse({"status": "not_found", "message": f"凭证 {voucher_id} 不存在"})
         if db_record.get("status") == "posted":
             return JSONResponse({"status": "already_posted", "message": f"凭证 {voucher_id} 已经过账"})
+        if user["role"] != "admin" and db_record["user_id"] != user["id"]:
+            return JSONResponse({"error": "无权过账此凭证"}, status_code=403)
 
     if voucher:
         _append_posted_csv(voucher)
@@ -75,6 +77,17 @@ async def confirm_voucher_batch(payload: dict, request: Request):
         return JSONResponse({"error": "请选择至少一个凭证"}, status_code=400)
     if len(voucher_ids) > 100:
         return JSONResponse({"error": "单次最多批量过账100个凭证"}, status_code=400)
+
+    # Non-admin users may only post their own vouchers
+    if user["role"] != "admin":
+        owned_records = await list_voucher_records(user_id=user["id"], limit=200, offset=0)
+        owned_ids = {r["voucher_id"] for r in owned_records}
+        unauthorized = [vid for vid in voucher_ids if vid not in owned_ids]
+        if unauthorized:
+            return JSONResponse(
+                {"error": f"无权过账以下凭证：{', '.join(unauthorized)}"},
+                status_code=403,
+            )
 
     result = await batch_mark_voucher_posted(voucher_ids, user["id"])
 

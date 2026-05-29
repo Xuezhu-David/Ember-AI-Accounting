@@ -1,139 +1,109 @@
-# Ember AI Accounting
+# Ember AI — 原生财务记账系统
 
-AI 原生智能会计凭证系统。通过自然语言对话、发票图片识别、Excel 上传，自动生成符合中国会计准则的会计凭证，支持 SAP 格式导出。
+> 基于 AI Agent 的 SAP 会计凭证自动生成与管理平台
+>
+> 本项目 Fork 自 [github.com/duzhuo/ember-ai-accounting](https://github.com/duzhuo/ember-ai-accounting)，在原有基础上扩展了 SAP CSV 导出、批量上传、移动端、审批流等功能。
 
-## 功能概览
+---
 
-### 自然语言对话
-- 6 种意图识别：业务描述、规则查询、规则管理、凭证查询、用户管理、闲聊
-- 流式 SSE 响应，实时输出
-- 多轮对话上下文（最多 200 条历史）
-- 支持追问补充信息
+## 一、Agent 的用处
 
-### 凭证生成
-- LLM 驱动的凭证生成，自动匹配会计规则
-- 支持业务类型：销售收入（sales_revenue）、费用报销（expense）
-- 自动借贷平衡校验
-- 置信度评分 + 警告提示
-- 凭证生命周期：草稿 → 过账
+### 1. 自然语言 → 会计凭证
 
-### 文件上传与 OCR
-- Excel 批量导入（.xlsx / .xls / .csv）
-- 图片发票识别（多模态 LLM OCR）
-- PDF 识别（PyMuPDF 转图片后 OCR）
-- 自动去重
+用户只需用中文描述一笔交易，Agent 就能自动：
 
-### 凭证规则引擎
-- 可配置的规则模板，存储于数据库
-- 按业务类型、产品类型、税率匹配
-- 内置销售收入和费用报销默认规则
-- 管理员可通过 API 或对话增删改规则
-- 税码映射：13%→X1, 6%→X6, 0%→X0
+- 识别业务类型（销售收入、费用报销、资产采购、工资薪酬、借款还款……）
+- 匹配对应的**凭证规则**（借贷科目、税码、利润中心等）
+- 计算含税/不含税金额、增值税
+- 生成标准 SAP 格式的会计凭证草稿（BUKRS/BLART/HKONT/WRBTR 等字段）
 
-### 凭证管理
-- 凭证列表（状态筛选：全部/草稿/已过账/已冲销）
-- 凭证搜索（关键词 + 日期范围）
-- 凭证详情查看（含分录行）
-- 草稿凭证在线编辑
-- 单条过账 + 批量过账（复选框多选）
-- 已过账凭证冲销（红字冲销凭证）
-- 导出 PDF（专业财务凭证格式）
-- 附件管理：上传、查看、删除
-
-### 安全机制
-- bcrypt 密码哈希（旧 SHA-256 自动迁移）
-- Session 过期（6 小时）
-- CORS 可配置（环境变量 `CORS_ORIGINS`）
-- 登录频率限制（5 次失败 / 5 分钟锁定）
-- 首次登录强制修改密码
-- 用户自助修改密码
-
-### SAP 导出
-- SAP 标准 CSV 格式（BUKRS, BLART, BLDAT, BUDAT 等字段）
-- 文件上传时自动导出
-- 过账凭证追加到 `data/output/posted_vouchers.csv`
-
-### 审计系统
-- 全操作审计日志：登录、登出、凭证生成、过账、规则管理、用户管理
-- 聊天记录持久化
-- 管理员可查看审计日志
-
-### A2UI 协议（声明式 UI）
-- 自研 Agent-to-UI 协议 v0.9
-- 支持组件：Text, Card, DataTable, KeyValue, Button, Row, FilterTabs, Badge, Modal, SearchInput 等
-- 前端根据服务端返回的组件声明动态渲染界面
-- DataTable 支持可选行（复选框批量操作）
-
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| 后端 | Python 3.13, FastAPI, Uvicorn |
-| Agent 框架 | AgentScope 2.0.0 |
-| 数据库 | SQLite (aiosqlite), WAL 模式 |
-| 密码安全 | bcrypt |
-| Excel 处理 | openpyxl |
-| PDF 识别 | PyMuPDF |
-| PDF 导出 | WeasyPrint + Jinja2 |
-| 前端 | 原生 HTML/CSS/JS, Phosphor Icons |
-| LLM | 可配置（默认 mimo-v2.5-pro） |
-
-## 项目结构
-
+示例输入：
 ```
-server.py              # FastAPI 入口：app 创建、router 注册、startup/shutdown
-database.py            # SQLite 数据库操作（用户、凭证、规则、审计、附件）
-prompts.py             # 从 prompts/*.md 加载 LLM 系统提示词
-voucher_rules.py       # 规则引擎：规则加载、默认规则定义、凭证构建
-voucher_models.py      # 数据模型：SalesTransaction, ExpenseTransaction, Voucher
-excel_loader.py        # Excel 文件解析
-sap_exporter.py        # SAP CSV 导出
-script.js              # 前端 JS：认证、聊天、文件上传、A2UI 渲染器
-index.html             # 前端页面
-style.css              # 样式表
-
-helpers/               # 工具函数
-  sse.py               # SSE 格式化、reply delta 提取
-  auth.py              # 认证、session 管理、voucher 序列化
-  a2ui.py              # A2UI 协议：voucher/rules/users 转声明式 UI
-  voucher.py           # voucher_to_front、rules 格式化
-  csv_export.py        # SAP CSV 追加导出
-  pdf_export.py        # PDF 导出（WeasyPrint + Jinja2）
-
-templates/             # Jinja2 模板
-  voucher_pdf.html     # 凭证 PDF 模板
-
-routes/                # API 路由（每个文件一个 APIRouter）
-  auth.py              # /api/auth/*, /api/users/*
-  chat.py              # /api/chat（SSE 流式）
-  upload.py            # /api/upload（SSE 流式）
-  vouchers.py          # /api/vouchers/*
-  rules.py             # /api/rules/*
-  audit.py             # /api/audit-logs, /api/chat-history
-  attachments.py       # /api/attachments/*
-  confirm.py           # /api/confirm
-  a2ui_action.py       # /api/a2ui-action
-
-prompts/               # LLM 提示词（.md 文件，可直接编辑）
-  intent_recognition.md
-  image_recognition.md
-  voucher_generation.md
-
-agents/                # AgentScope Agent
-  intent_agent.py      # 意图分类 Agent
-  voucher_agent.py     # 凭证生成 Agent
-  ocr_agent.py         # OCR Agent
-  model_factory.py     # LLM 模型工厂
-  middleware.py         # Agent 中间件：日志、计时、追踪
-
-data/                  # 运行时数据（已 gitignore）
-  ember.db             # SQLite 数据库
-  uploads/             # 上传文件
-  output/              # 导出的 SAP CSV
-  sessions/            # 会话上下文
+销售软件产品给华为公司，不含税金额 100,000 元，税率 13%
 ```
 
-## 快速开始
+Agent 输出包含三行分录的凭证：应收账款（借）/ 主营业务收入（贷）/ 应交税费（贷）。
+
+### 2. 图片/PDF/Excel → 凭证（OCR + 解析）
+
+上传发票图片、PDF 或 Excel，OCR Agent 自动提取关键字段，再由 Voucher Agent 生成凭证。支持批量拖入多文件。
+
+### 3. 凭证全生命周期管理
+
+- 草稿 / 待审批 / 已过账 / 已冲销 全状态管理
+- 支持凭证搜索、过滤、批量过账
+- 操作全程写入审计日志
+
+### 4. SAP CSV 导出
+
+一键导出符合 SAP 批量导入格式的 CSV 文件，字段对应：
+
+| CSV 列 | SAP 字段 |
+|--------|----------|
+| BUKRS | 公司代码 |
+| BLART | 凭证类型 |
+| BLDAT | 凭证日期 |
+| BUDAT | 过账日期 |
+| HKONT | 科目代码 |
+| WRBTR | 金额 |
+| SHKZG | 借/贷标志 |
+| KUNNR | 客户编码 |
+| MWSKZ | 税码 |
+| PRCTR | 利润中心 |
+| KOSTL | 成本中心 |
+| SGTXT | 摘要 |
+
+### 5. 审批流（预制）
+
+凭证支持"提交审批 → 指定审批人 → 审批通过/驳回"流程：
+
+```
+draft → pending_approval → posted（通过）
+                        → draft（驳回，可修改后重提）
+```
+
+API 端点已完整实现（`routes/approval.py`），可按需接入企业通知（邮件/IM/企业微信）。
+
+---
+
+## 二、架构概览
+
+```
+┌─────────────────────────────────────────────────────┐
+│                     前端                            │
+│  PC：index.html + script.js + style.css             │
+│  移动：mobile.html + mobile.js + mobile.css         │
+│  协议：A2UI v0.9（声明式 UI 组件，JSON 驱动）        │
+└──────────────────┬──────────────────────────────────┘
+                   │ HTTP / SSE
+┌──────────────────▼──────────────────────────────────┐
+│              FastAPI 后端  server.py                 │
+│  routes/: chat  upload  confirm  vouchers  rules     │
+│           auth  attachments  export  approval  audit │
+└──────────────────┬──────────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────────┐
+│           AgentScope 2.0 多 Agent 层                 │
+│  IntentAgent   — 意图识别 + 结构化抽取               │
+│  VoucherAgent  — 凭证规则匹配 + 分录生成             │
+│  OcrAgent      — 图片/PDF 文字提取与解析             │
+└──────────────────┬──────────────────────────────────┘
+                   │ LLM API
+┌──────────────────▼──────────────────────────────────┐
+│         大模型（可替换，见下方说明）                  │
+│  默认：Claude claude-sonnet-4-5（Anthropic）         │
+└─────────────────────────────────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────────────┐
+│      SQLite（aiosqlite + WAL）  database.py          │
+│  voucher_records / approval_records / users          │
+│  chat_sessions / audit_logs / attachments            │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、快速开始
 
 ### 1. 环境准备
 
@@ -143,33 +113,94 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+### 2. 配置
 
-复制 `.env.example` 为 `.env`，配置 LLM API：
+复制 `.env.example` → `.env`，填入：
 
 ```env
-PMDE_BASE_URL=https://your-llm-endpoint/v1
-PMDE_API_KEY=your-api-key
-PMDE_MODEL_NAME=your-model
-PMDE_VISION_MODEL_NAME=your-vision-model
+# Anthropic Claude（默认）
+ANTHROPIC_AUTH_TOKEN=sk-ant-...
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-5
+
+# 或 DeepSeek（见下方替换说明）
+# DEEPSEEK_API_KEY=sk-...
 ```
 
 ### 3. 启动
 
 ```bash
 python server.py
+# 访问 http://localhost:8000
+# 默认账号：admin / admin123
 ```
 
-访问 `http://localhost:8000`，默认管理员账号：`admin` / `admin123`
+启动时自动完成：数据库初始化、默认管理员创建、凭证规则种子数据写入、AgentScope Agent 初始化。
 
-### 启动时自动完成
+---
 
-- 数据库初始化
-- 默认管理员创建
-- 默认凭证规则种子数据写入
-- AgentScope Agent 初始化
+## 四、将模型替换为 DeepSeek（或其他兼容 OpenAI 的模型）
 
-## API 接口
+所有 Agent 的模型创建统一在 **`agents/model_factory.py`**，只需修改这一个文件。
+
+DeepSeek API 兼容 OpenAI 格式：
+
+### 方案 A：换 Base URL（最简单）
+
+```python
+# agents/model_factory.py
+
+from agentscope.credential import OpenAIChatCredential
+from agentscope.model import OpenAIChatModel
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+
+def create_chat_model(vision: bool = False) -> OpenAIChatModel:
+    return OpenAIChatModel(
+        credential=OpenAIChatCredential(
+            api_key=DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/v1",
+        ),
+        model="deepseek-chat",
+        stream=True,
+        parameters=OpenAIChatModel.Parameters(temperature=0.1),
+    )
+```
+
+`.env` 中加：
+
+```env
+DEEPSEEK_API_KEY=sk-...
+```
+
+### 方案 B：动态切换
+
+在 `model_factory.py` 中读取 `LLM_PROVIDER` 环境变量（`anthropic` / `deepseek` / `openai`），根据值选择对应的模型类，无需改代码即可运行时切换。
+
+### 注意事项
+
+| 项目 | 说明 |
+|------|------|
+| 视觉能力 | DeepSeek `deepseek-chat` 不支持 vision；OCR 功能可单独保留 Claude 视觉模型（混用） |
+| 提示词兼容性 | `IntentAgent` / `VoucherAgent` 的 Prompt 基于 `agentscope.message.Msg` 接口，与底层模型解耦，无需修改 |
+| 本地部署 | Ollama / vLLM 同样仅需修改 `base_url` 和 `model` 参数 |
+
+---
+
+## 五、扩展性
+
+| 扩展方向 | 实现位置 | 说明 |
+|---------|---------|------|
+| 新增业务凭证类型 | `data/rules/*.xlsx` + DB `voucher_rules` 表 | 在规则表中增加新规则，Agent 自动匹配，无需改代码 |
+| 新增 Agent | `agents/` | 继承 `agentscope.agent.Agent`，注册到 `intent_agent` 的路由表 |
+| 接入企业 SSO | `routes/auth.py` | 替换 session 登录为 SAML/OAuth2 |
+| 邮件/IM 审批通知 | `routes/approval.py` | `submit_for_approval` 后调用 SMTP/Exchange/企业微信 API |
+| 多公司代码 | `database.py` + `agents/voucher_agent.py` | 在凭证上下文中加入 `company_code` 参数 |
+| 导出到 SAP RFC | `helpers/csv_export.py` | 用 PyRFC 替换 CSV 写文件 |
+| 多语言 UI | `index.html` / `mobile.html` | 将硬编码中文字符串改为 i18n key |
+
+---
+
+## 六、API 接口
 
 ### 认证
 
@@ -179,7 +210,6 @@ python server.py
 | POST | `/api/auth/logout` | 登出 |
 | GET | `/api/auth/me` | 当前用户信息 |
 | PUT | `/api/auth/password` | 修改密码 |
-| GET | `/api/health` | 健康检查 |
 
 ### 对话
 
@@ -192,13 +222,29 @@ python server.py
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/vouchers` | 凭证列表（支持 keyword/date_from/date_to 筛选） |
+| GET | `/api/vouchers` | 凭证列表（支持 keyword/status/date 筛选） |
 | GET | `/api/vouchers/{id}` | 凭证详情 |
 | PUT | `/api/vouchers/{id}` | 更新草稿凭证 |
 | POST | `/api/vouchers/{id}/reverse` | 冲销已过账凭证 |
-| GET | `/api/vouchers/{id}/pdf` | 导出凭证 PDF |
 | POST | `/api/confirm` | 单条过账 |
 | POST | `/api/confirm/batch` | 批量过账 |
+
+### 审批流
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/vouchers/{id}/submit` | 提交审批（`approver_id` 或 `no_approval=true`） |
+| POST | `/api/vouchers/{id}/approve` | 审批通过（凭证过账） |
+| POST | `/api/vouchers/{id}/reject` | 驳回（附原因，凭证回到草稿） |
+| GET | `/api/approvals/pending` | 待我审批的凭证列表 |
+| GET | `/api/users/approvers` | 可选审批人列表 |
+
+### 导出
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/export/csv?ids=id1,id2,...` | 导出指定凭证为 SAP CSV |
+| GET | `/api/export/csv/all` | 导出全部已过账凭证 CSV |
 
 ### 规则
 
@@ -209,68 +255,59 @@ python server.py
 | PUT | `/api/rules/{code}` | 修改规则（管理员） |
 | DELETE | `/api/rules/{code}` | 删除规则（管理员） |
 
-### 用户管理（管理员）
+---
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/users` | 用户列表 |
-| POST | `/api/users` | 创建用户 |
-| PUT | `/api/users/{id}` | 修改用户 |
-| DELETE | `/api/users/{id}` | 删除用户 |
+## 七、目录结构
 
-### A2UI
+```
+ember-ai-accounting/
+├── server.py              # FastAPI 入口
+├── database.py            # SQLite 数据层（aiosqlite）
+├── agents/
+│   ├── model_factory.py   # ← 替换模型的唯一入口
+│   ├── intent_agent.py    # 意图分类 Agent
+│   ├── voucher_agent.py   # 凭证生成 Agent
+│   └── ocr_agent.py       # OCR Agent
+├── routes/
+│   ├── chat.py            # SSE 聊天流
+│   ├── upload.py          # 文件上传 + OCR
+│   ├── confirm.py         # 过账
+│   ├── approval.py        # 审批流 API（新增）
+│   ├── export.py          # SAP CSV 导出（新增）
+│   └── ...
+├── helpers/
+│   ├── a2ui.py            # A2UI v0.9 声明式 UI 构建
+│   ├── csv_export.py      # SAP CSV 列映射
+│   └── auth.py            # 会话鉴权
+├── prompts/               # 系统提示词（.md，可直接编辑）
+├── data/
+│   ├── rules/             # 凭证规则 Excel
+│   └── output/            # 导出 CSV
+├── index.html             # PC 端
+├── mobile.html            # 移动端（新增）
+└── style.css / mobile.css
+```
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/a2ui-action` | 处理 UI 组件事件 |
+---
 
-### 附件
+## 八、技术栈
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/vouchers/{id}/attachments` | 凭证附件列表 |
-| POST | `/api/vouchers/{id}/attachments` | 上传附件 |
-| DELETE | `/api/attachments/{id}` | 删除附件 |
-
-### 审计（管理员）
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/audit-logs` | 审计日志 |
-| GET | `/api/chat-history` | 聊天记录 |
-| GET | `/api/my-chat-history` | 当前用户会话恢复 |
-
-## 数据库表结构
-
-| 表名 | 说明 |
+| 层级 | 技术 |
 |------|------|
-| `users` | 用户账号 |
-| `sessions` | 会话令牌 |
-| `voucher_records` | 凭证记录 |
-| `chat_messages` | 聊天记录 |
-| `audit_logs` | 审计日志 |
-| `voucher_rules` | 凭证规则定义 |
-| `voucher_rule_lines` | 规则分录行模板 |
-| `voucher_attachments` | 凭证附件 |
+| 后端 | Python 3.11+, FastAPI, Uvicorn |
+| Agent 框架 | AgentScope 2.0 |
+| 数据库 | SQLite (aiosqlite), WAL 模式 |
+| 密码安全 | bcrypt |
+| Excel 处理 | openpyxl |
+| PDF 识别 | PyMuPDF |
+| PDF 导出 | WeasyPrint + Jinja2 |
+| 前端 | 原生 HTML/CSS/JS, Phosphor Icons |
+| LLM（默认） | Claude claude-sonnet-4-5（Anthropic），可替换为 DeepSeek/任意 OpenAI 兼容模型 |
 
-## 使用示例
+---
 
-### 自然语言生成凭证
+## 九、致谢
 
-```
-用户：卖软件给华为，不含税10万元，13%税率
-助手：已为您生成凭证草稿（置信度 0.95）
-      [凭证详情：借 应收账款 113,000 / 贷 主营业务收入 100,000 / 贷 应交税费 13,000]
-```
-
-### 图片识别
-
-上传发票图片，系统自动识别金额、税率、客户信息，生成凭证。
-
-### 查询规则
-
-```
-用户：查看凭证规则
-助手：以下是「全部」类型的凭证规则，共 2 条：
-      [规则列表，点击查看分录行详情]
-```
+- **原始项目**：[github.com/duzhuo/ember-ai-accounting](https://github.com/duzhuo/ember-ai-accounting) — 感谢原作者提供的基础架构与 Agent 设计
+- **多 Agent 框架**：[AgentScope 2.0](https://github.com/modelscope/agentscope)
+- **LLM**：Anthropic Claude（默认）/ DeepSeek / 其他 OpenAI 兼容模型
